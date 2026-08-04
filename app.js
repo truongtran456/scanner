@@ -359,12 +359,18 @@ const MarkerUtil = {
     },
 
     decode(imageData, width, height, students) {
-        if (!students?.length) return null;
+        const all = this.decodeAll(imageData, width, height, students);
+        if (!all.length) return null;
+        return all.reduce((a, b) => (a.rank > b.rank ? a : b));
+    },
+
+    decodeAll(imageData, width, height, students) {
+        if (!students?.length) return [];
 
         let data = imageData;
         let w = width;
         let h = height;
-        const maxW = 520;
+        const maxW = 640;
         if (width > maxW) {
             const scaled = this._downscale(imageData, width, height, maxW);
             data = scaled.data;
@@ -377,15 +383,15 @@ const MarkerUtil = {
             grid: this.getGrid(st.cardNumber)
         }));
 
-        let best = null;
+        const byCard = new Map();
         const minSide = Math.min(w, h);
-        const sizeRatios = [0.24, 0.32, 0.4, 0.5, 0.62];
+        const sizeRatios = [0.08, 0.11, 0.14, 0.18, 0.22, 0.28, 0.35, 0.42];
         const positions = [];
-        for (let gy = 0; gy < 3; gy++) {
-            for (let gx = 0; gx < 3; gx++) {
+        for (let gy = 0; gy < 5; gy++) {
+            for (let gx = 0; gx < 5; gx++) {
                 positions.push([
-                    w * (0.22 + gx * 0.28),
-                    h * (0.22 + gy * 0.28)
+                    w * (0.08 + gx * 0.21),
+                    h * (0.1 + gy * 0.18)
                 ]);
             }
         }
@@ -400,26 +406,27 @@ const MarkerUtil = {
                         const rotated = this.rotateGrid(polar, rot);
                         for (const p of patterns) {
                             const m = this.gridMatch(rotated, p.grid, true);
-                            const ok = m.borderScore >= 0.72 && (m.score >= 0.76 || m.d <= 11);
+                            const ok = m.borderScore >= 0.68 && (m.score >= 0.72 || m.d <= 13);
                             if (!ok) continue;
                             const rank = m.score * 100 + m.borderScore * 10 - m.d * 0.01;
-                            if (!best || rank > best.rank) {
-                                best = {
-                                    rank,
-                                    dist: m.d,
-                                    score: m.score,
-                                    cardId: p.student.cardId,
-                                    cardNumber: p.student.cardNumber,
-                                    student: p.student,
-                                    orientation: this.ORIENT[rot]
-                                };
-                            }
+                            const hit = {
+                                rank,
+                                dist: m.d,
+                                score: m.score,
+                                cardId: p.student.cardId,
+                                cardNumber: p.student.cardNumber,
+                                student: p.student,
+                                orientation: this.ORIENT[rot],
+                                cx, cy
+                            };
+                            const prev = byCard.get(p.student.cardId);
+                            if (!prev || hit.rank > prev.rank) byCard.set(p.student.cardId, hit);
                         }
                     }
                 }
             }
         }
-        return best;
+        return Array.from(byCard.values());
     },
 
     _downscale(src, sw, sh, maxW) {
@@ -510,18 +517,18 @@ const CardScanner = {
             return;
         }
 
-        // 2) Marker grid — quét toàn khung
+        // 2) Marker grid — quét full khung, nhiều thẻ cùng lúc
         if (this.frameCount % 2 === 0) {
-            const hit = MarkerUtil.decode(img.data, img.width, img.height, students);
-            if (hit) {
+            const hits = MarkerUtil.decodeAll(img.data, img.width, img.height, students);
+            for (const hit of hits) {
                 this._processHit(hit.cardId, hit.orientation, hit.student);
-                return;
             }
+            if (hits.length) return;
         }
 
         if (this.frameCount % 20 === 0) {
             $('#scan-hint')?.classList.remove('hidden');
-            $('#scan-hint').textContent = 'Đưa mã vuông thẻ vào khung — chiếu sáng đủ, giữ ổn định ~1 giây';
+            $('#scan-hint').textContent = 'Giơ thẻ hướng đáp án lên trên — quét được nhiều em cùng lúc';
         }
     },
 
@@ -630,7 +637,10 @@ function renderScanner() {
     $('#scanner-answered-list').innerHTML = s.students.map(st => {
         const a = s.answers.find(x => x.questionId === q?.id && x.studentId === st.id);
         const done = a?.answer;
-        return `<span class="answered-chip ${done ? '' : 'pending'}">${done ? '✓' : '○'} ${esc(st.name)}${done ? ' (' + a.answer + ')' : ''}</span>`;
+        return `<span class="answered-chip ${done ? '' : 'pending'}">
+            <span>${esc(st.name)}</span>
+            <strong>${done || '—'}</strong>
+        </span>`;
     }).join('');
 
     if (isResult && q) {
