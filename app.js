@@ -75,6 +75,7 @@ const SyncEngine = {
     conn: null,
     onMessage: null,
     reconnectTimer: null,
+    statePollTimer: null,
 
     connectScanner(sessionId) {
         return new Promise((resolve) => {
@@ -93,9 +94,9 @@ const SyncEngine = {
                         settled = true;
                         resolve(ok);
                     };
+                    conn.on('data', (data) => this._handle(data));
                     conn.on('open', () => {
                         this.conn = conn;
-                        conn.on('data', (data) => this._handle(data));
                         done(true);
                     });
                     conn.on('error', () => done(false));
@@ -118,10 +119,15 @@ const SyncEngine = {
 
     destroy() {
         clearInterval(this.reconnectTimer);
+        clearInterval(this.statePollTimer);
         this.conn?.close();
         this.peer?.destroy();
         this.conn = null;
         this.peer = null;
+    },
+
+    requestState() {
+        this.send({ type: 'REQUEST_STATE' });
     }
 };
 
@@ -148,6 +154,8 @@ function recordAnswer(session, studentId, cardId, answer) {
     const q = getCurrentQuestion(session);
     if (!q || session.status === SESSION_STATUS.QUESTION_LOCKED ||
         session.status === SESSION_STATUS.QUESTION_RESULT) return { ok: false };
+
+    if (!session.answers) session.answers = [];
 
     const existingIdx = getAnswerKey(session, q.id, studentId);
     const record = {
@@ -209,16 +217,18 @@ function onSessionUpdated() {
 
     if (s.status === SESSION_STATUS.COMPLETED) {
         CardScanner.stop();
+        clearInterval(SyncEngine.statePollTimer);
         showView('ended');
         return;
     }
 
-    if (s.questions?.length) {
+    if (s.questions?.length && s.students?.length) {
+        clearInterval(SyncEngine.statePollTimer);
         if (!appState.cameraReady) startCamera();
         else renderScanner();
         showView('scanner');
     } else {
-        $('#wait-status').textContent = 'Đã kết nối — chờ giáo viên bắt đầu câu hỏi...';
+        $('#wait-status').textContent = 'Đã kết nối — đang lấy danh sách lớp và câu hỏi...';
     }
 }
 
@@ -246,11 +256,199 @@ function handleSyncMessage(msg) {
     }
 }
 
+/* ===== MARKER (Plickers-style) — nhận diện thẻ số + hướng A/B/C/D ===== */
+const MarkerUtil = {
+    ORIENT: ['A', 'D', 'C', 'B'],
+
+    getGrid(cardNumber) {
+        const grid = Array.from({ length: 7 }, () => Array(7).fill(0));
+        for (let i = 0; i < 7; i++) {
+            grid[0][i] = grid[6][i] = grid[i][0] = grid[i][6] = 1;
+        }
+        let seed = cardNumber * 7919 + 104729;
+        for (let r = 1; r < 6; r++) {
+            for (let c = 1; c < 6; c++) {
+                seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+                grid[r][c] = (seed % 3) !== 0 ? 1 : 0;
+            }
+        }
+        grid[1][1] = grid[1][5] = grid[5][1] = 1;
+        grid[5][5] = 0;
+        return grid;
+    },
+
+    rotateGrid(grid, times) {
+        let g = grid.map(row => [...row]);
+        for (let t = 0; t < times; t++) {
+            const n = g.length;
+            const rotated = Array.from({ length: n }, () => Array(n).fill(0));
+            for (let r = 0; r < n; r++) {
+                for (let c = 0; c < n; c++) {
+                    rotated[c][n - 1 - r] = g[r][c];
+                }
+            }
+            g = rotated;
+        }
+        return g;
+    },
+
+    invertGrid(grid) {
+        return grid.map(row => row.map(v => 1 - v));
+    },
+
+    gridMatch(a, b, skipCenter = true) {
+        let d = 0, n = 0, borderD = 0, borderN = 0;
+        for (let r = 0; r < 7; r++) {
+            for (let c = 0; c < 7; c++) {
+                const isBorder = r === 0 || r === 6 || c === 0 || c === 6;
+                if (skipCenter && r >= 2 && r <= 4 && c >= 2 && c <= 4) continue;
+                n++;
+                if (a[r][c] !== b[r][c]) d++;
+                if (isBorder) {
+                    borderN++;
+                    if (a[r][c] !== b[r][c]) borderD++;
+                }
+            }
+        }
+        return {
+            d,
+            n,
+            score: n ? 1 - d / n : 0,
+            borderScore: borderN ? 1 - borderD / borderN : 0
+        };
+    },
+
+    sampleGrid(imageData, width, height, cx, cy, boxSize) {
+        const cell = boxSize / 7;
+        const lums = Array.from({ length: 7 }, () => Array(7).fill(128));
+
+        for (let r = 0; r < 7; r++) {
+            for (let c = 0; c < 7; c++) {
+                const x0 = Math.floor(cx - boxSize / 2 + c * cell + cell * 0.15);
+                const y0 = Math.floor(cy - boxSize / 2 + r * cell + cell * 0.15);
+                const x1 = Math.floor(cx - boxSize / 2 + (c + 1) * cell - cell * 0.15);
+                const y1 = Math.floor(cy - boxSize / 2 + (r + 1) * cell - cell * 0.15);
+                let sum = 0, count = 0;
+                for (let y = y0; y < y1; y++) {
+                    for (let x = x0; x < x1; x++) {
+                        if (x < 0 || y < 0 || x >= width || y >= height) continue;
+                        const i = (y * width + x) * 4;
+                        sum += 0.299 * imageData[i] + 0.587 * imageData[i + 1] + 0.114 * imageData[i + 2];
+                        count++;
+                    }
+                }
+                lums[r][c] = count ? sum / count : 128;
+            }
+        }
+
+        const borderVals = [];
+        for (let i = 0; i < 7; i++) {
+            borderVals.push(lums[0][i], lums[6][i], lums[i][0], lums[i][6]);
+        }
+        borderVals.sort((a, b) => a - b);
+        const mid = borderVals[Math.floor(borderVals.length / 2)];
+        const innerVals = [];
+        for (let r = 1; r < 6; r++) {
+            for (let c = 1; c < 6; c++) innerVals.push(lums[r][c]);
+        }
+        innerVals.sort((a, b) => a - b);
+        const innerMid = innerVals[Math.floor(innerVals.length / 2)];
+        const threshold = (mid + innerMid) / 2;
+
+        return lums.map(row => row.map(v => (v < threshold ? 1 : 0)));
+    },
+
+    decode(imageData, width, height, students) {
+        if (!students?.length) return null;
+
+        let data = imageData;
+        let w = width;
+        let h = height;
+        const maxW = 520;
+        if (width > maxW) {
+            const scaled = this._downscale(imageData, width, height, maxW);
+            data = scaled.data;
+            w = scaled.width;
+            h = scaled.height;
+        }
+
+        const patterns = students.map(st => ({
+            student: st,
+            grid: this.getGrid(st.cardNumber)
+        }));
+
+        let best = null;
+        const minSide = Math.min(w, h);
+        const sizeRatios = [0.24, 0.32, 0.4, 0.5, 0.62];
+        const positions = [];
+        for (let gy = 0; gy < 3; gy++) {
+            for (let gx = 0; gx < 3; gx++) {
+                positions.push([
+                    w * (0.22 + gx * 0.28),
+                    h * (0.22 + gy * 0.28)
+                ]);
+            }
+        }
+
+        for (const [cx, cy] of positions) {
+            for (const ratio of sizeRatios) {
+                const boxSize = minSide * ratio;
+                const sampled = this.sampleGrid(data, w, h, cx, cy, boxSize);
+
+                for (const polar of [sampled, this.invertGrid(sampled)]) {
+                    for (let rot = 0; rot < 4; rot++) {
+                        const rotated = this.rotateGrid(polar, rot);
+                        for (const p of patterns) {
+                            const m = this.gridMatch(rotated, p.grid, true);
+                            const ok = m.borderScore >= 0.72 && (m.score >= 0.76 || m.d <= 11);
+                            if (!ok) continue;
+                            const rank = m.score * 100 + m.borderScore * 10 - m.d * 0.01;
+                            if (!best || rank > best.rank) {
+                                best = {
+                                    rank,
+                                    dist: m.d,
+                                    score: m.score,
+                                    cardId: p.student.cardId,
+                                    cardNumber: p.student.cardNumber,
+                                    student: p.student,
+                                    orientation: this.ORIENT[rot]
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return best;
+    },
+
+    _downscale(src, sw, sh, maxW) {
+        const scale = maxW / sw;
+        const dw = Math.floor(sw * scale);
+        const dh = Math.floor(sh * scale);
+        const out = new Uint8ClampedArray(dw * dh * 4);
+        for (let y = 0; y < dh; y++) {
+            for (let x = 0; x < dw; x++) {
+                const sx = Math.min(sw - 1, Math.floor(x / scale));
+                const sy = Math.min(sh - 1, Math.floor(y / scale));
+                const si = (sy * sw + sx) * 4;
+                const di = (y * dw + x) * 4;
+                out[di] = src[si];
+                out[di + 1] = src[si + 1];
+                out[di + 2] = src[si + 2];
+                out[di + 3] = 255;
+            }
+        }
+        return { data: out, width: dw, height: dh };
+    }
+};
+
 /* ===== CARD SCANNER ===== */
 const CardScanner = {
     stream: null,
     rafId: null,
     lastScan: {},
+    frameCount: 0,
 
     async start(videoEl, canvasEl) {
         try {
@@ -273,11 +471,12 @@ const CardScanner = {
         this.stream?.getTracks().forEach(t => t.stop());
         this.stream = null;
         this.lastScan = {};
+        this.frameCount = 0;
         appState.cameraReady = false;
     },
 
     _loop(video, canvas) {
-        const ctx = canvas.getContext('2d');
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
         const tick = () => {
             if (!this.stream) return;
             if (video.readyState === video.HAVE_ENOUGH_DATA) {
@@ -285,15 +484,48 @@ const CardScanner = {
                 canvas.height = video.videoHeight;
                 ctx.drawImage(video, 0, 0);
                 const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                const code = jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
-                if (code?.data) this._process(code);
+                this.frameCount++;
+                this._scanFrame(img);
             }
             this.rafId = requestAnimationFrame(tick);
         };
         tick();
     },
 
-    _process(code) {
+    _scanFrame(img) {
+        const students = appState.session?.students || [];
+
+        if (!students.length) {
+            if (this.frameCount % 45 === 0) {
+                $('#scan-hint')?.classList.remove('hidden');
+                $('#scan-hint').textContent = 'Chưa có danh sách học sinh — mở phiên trên máy tính trước';
+            }
+            return;
+        }
+
+        // 1) jsQR — QR ở giữa thẻ in PDF
+        const code = jsQR(img.data, img.width, img.height, { inversionAttempts: 'attemptBoth' });
+        if (code?.data) {
+            this._processQr(code);
+            return;
+        }
+
+        // 2) Marker grid — quét toàn khung
+        if (this.frameCount % 2 === 0) {
+            const hit = MarkerUtil.decode(img.data, img.width, img.height, students);
+            if (hit) {
+                this._processHit(hit.cardId, hit.orientation, hit.student);
+                return;
+            }
+        }
+
+        if (this.frameCount % 20 === 0) {
+            $('#scan-hint')?.classList.remove('hidden');
+            $('#scan-hint').textContent = 'Đưa mã vuông thẻ vào khung — chiếu sáng đủ, giữ ổn định ~1 giây';
+        }
+    },
+
+    _processQr(code) {
         const data = code.data.trim();
         let cardId = null;
         if (data.startsWith('CARD-')) cardId = data.split('|')[0];
@@ -303,19 +535,19 @@ const CardScanner = {
                 cardId = j.card || j.cardId;
             } catch (_) {}
         }
-        if (!cardId) {
-            $('#scan-hint')?.classList.remove('hidden');
-            $('#scan-hint').textContent = 'Không nhận diện thẻ — đưa mã QR vào khung';
-            return;
-        }
+        if (!cardId) return;
         $('#scan-hint')?.classList.add('hidden');
-
         const orientation = this._getOrientation(code.location);
+        this._processHit(cardId, orientation);
+    },
+
+    _processHit(cardId, orientation, knownStudent = null) {
         const key = cardId + orientation;
         const now = Date.now();
-        if (this.lastScan[key] && now - this.lastScan[key] < 1500) return;
+        if (this.lastScan[key] && now - this.lastScan[key] < 900) return;
         this.lastScan[key] = now;
-        onCardScanned(cardId, orientation);
+        $('#scan-hint')?.classList.add('hidden');
+        onCardScanned(cardId, orientation, knownStudent);
     },
 
     _getOrientation(loc) {
@@ -330,12 +562,12 @@ const CardScanner = {
     }
 };
 
-function onCardScanned(cardId, orientation) {
+function onCardScanned(cardId, orientation, knownStudent = null) {
     const s = appState.session;
     if (!s?.students?.length) return;
     if (s.status === SESSION_STATUS.QUESTION_LOCKED || s.status === SESSION_STATUS.QUESTION_RESULT) return;
 
-    const student = s.students.find(st => st.cardId === cardId);
+    const student = knownStudent || s.students.find(st => st.cardId === cardId);
     if (!student) {
         showScanToast('Không tìm thấy học sinh cho thẻ này', false);
         return;
@@ -345,7 +577,15 @@ function onCardScanned(cardId, orientation) {
     if (!result.ok) return;
 
     const eventType = result.updated ? 'ANSWER_UPDATED' : 'ANSWER_SCANNED';
-    SyncEngine.send({ type: eventType, session: getSessionSnapshot(), studentId: student.id, answer: orientation });
+    const q = getCurrentQuestion(s);
+    SyncEngine.send({
+        type: eventType,
+        studentId: student.id,
+        cardId,
+        answer: orientation,
+        questionId: q?.id,
+        session: getSessionSnapshot()
+    });
 
     const tag = $('#scan-student-tag');
     tag.textContent = student.name;
@@ -494,12 +734,29 @@ function startReconnectLoop(sessionId) {
             const ok = await SyncEngine.connectScanner(sessionId);
             if (ok) {
                 $('#scanner-reconnect')?.classList.add('hidden');
-                SyncEngine.send({ type: 'SCANNER_CONNECTED', from: 'scanner' });
-                SyncEngine.send({ type: 'REQUEST_STATE' });
+                notifyHostConnected();
+                startStatePoll();
                 $('#wait-status').textContent = 'Đã kết nối lại';
             }
         }
     }, 5000);
+}
+
+function startStatePoll() {
+    clearInterval(SyncEngine.statePollTimer);
+    SyncEngine.statePollTimer = setInterval(() => {
+        if (appState.session?.questions?.length && appState.session?.students?.length) {
+            clearInterval(SyncEngine.statePollTimer);
+            onSessionUpdated();
+            return;
+        }
+        if (SyncEngine.conn?.open) SyncEngine.requestState();
+    }, 2000);
+}
+
+function notifyHostConnected() {
+    SyncEngine.send({ type: 'SCANNER_CONNECTED', from: 'scanner' });
+    SyncEngine.requestState();
 }
 
 async function init(sessionId) {
@@ -513,11 +770,11 @@ async function init(sessionId) {
 
     const connected = await SyncEngine.connectScanner(sessionId);
     if (connected) {
-        SyncEngine.send({ type: 'SCANNER_CONNECTED', from: 'scanner' });
-        SyncEngine.send({ type: 'REQUEST_STATE' });
-        $('#wait-status').textContent = 'Đã kết nối — chờ dữ liệu từ máy chiếu...';
+        notifyHostConnected();
+        $('#wait-status').textContent = 'Đã kết nối — đang lấy dữ liệu từ máy chiếu...';
+        startStatePoll();
     } else {
-        $('#wait-status').textContent = 'Chưa kết nối được — đảm bảo giáo viên đã mở phiên trên máy tính';
+        $('#wait-status').textContent = 'Chưa kết nối — mở phiên trên máy tính trước, rồi quét lại QR';
         showToast('Đang thử kết nối lại...');
     }
 
