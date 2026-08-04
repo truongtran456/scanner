@@ -258,7 +258,13 @@ function handleSyncMessage(msg) {
 
 /* ===== MARKER (Plickers-style) — nhận diện thẻ số + hướng A/B/C/D ===== */
 const MarkerUtil = {
+    // rot=0 → A ở trên; rot=1 → D; rot=2 → C; rot=3 → B
     ORIENT: ['A', 'D', 'C', 'B'],
+
+    MIN_SCORE: 0.86,
+    MIN_BORDER: 0.90,
+    MAX_DIST: 7,
+    MIN_GAP: 0.06,
 
     getGrid(cardNumber) {
         const grid = Array.from({ length: 7 }, () => Array(7).fill(0));
@@ -316,6 +322,48 @@ const MarkerUtil = {
             score: n ? 1 - d / n : 0,
             borderScore: borderN ? 1 - borderD / borderN : 0
         };
+    },
+
+    anchorsMatch(a, b) {
+        const pts = [[1, 1], [1, 5], [5, 1], [5, 5]];
+        return pts.every(([r, c]) => a[r][c] === b[r][c]);
+    },
+
+    matchAtSample(sampled, patterns) {
+        let best = null;
+        let second = null;
+
+        for (let rot = 0; rot < 4; rot++) {
+            const rotated = this.rotateGrid(sampled, rot);
+            for (const p of patterns) {
+                const m = this.gridMatch(rotated, p.grid, true);
+                if (m.borderScore < this.MIN_BORDER || m.score < this.MIN_SCORE || m.d > this.MAX_DIST) continue;
+                if (!this.anchorsMatch(rotated, p.grid)) continue;
+
+                const hit = {
+                    rank: m.score * 100 + m.borderScore * 10 - m.d,
+                    dist: m.d,
+                    score: m.score,
+                    borderScore: m.borderScore,
+                    cardId: p.student.cardId,
+                    cardNumber: p.student.cardNumber,
+                    student: p.student,
+                    orientation: this.ORIENT[rot],
+                    rot
+                };
+
+                if (!best || hit.rank > best.rank) {
+                    second = best;
+                    best = hit;
+                } else if (!second || hit.rank > second.rank) {
+                    second = hit;
+                }
+            }
+        }
+
+        if (!best) return null;
+        if (second && best.rank - second.rank < this.MIN_GAP * 100) return null;
+        return best;
     },
 
     sampleGrid(imageData, width, height, cx, cy, boxSize) {
@@ -383,50 +431,36 @@ const MarkerUtil = {
             grid: this.getGrid(st.cardNumber)
         }));
 
-        const byCard = new Map();
+        const raw = [];
         const minSide = Math.min(w, h);
-        const sizeRatios = [0.08, 0.11, 0.14, 0.18, 0.22, 0.28, 0.35, 0.42];
-        const positions = [];
-        for (let gy = 0; gy < 5; gy++) {
-            for (let gx = 0; gx < 5; gx++) {
-                positions.push([
-                    w * (0.08 + gx * 0.21),
-                    h * (0.1 + gy * 0.18)
-                ]);
-            }
-        }
+        const sizeRatios = [0.20, 0.26, 0.32, 0.40];
 
-        for (const [cx, cy] of positions) {
-            for (const ratio of sizeRatios) {
-                const boxSize = minSide * ratio;
-                const sampled = this.sampleGrid(data, w, h, cx, cy, boxSize);
-
-                for (const polar of [sampled, this.invertGrid(sampled)]) {
-                    for (let rot = 0; rot < 4; rot++) {
-                        const rotated = this.rotateGrid(polar, rot);
-                        for (const p of patterns) {
-                            const m = this.gridMatch(rotated, p.grid, true);
-                            const ok = m.borderScore >= 0.68 && (m.score >= 0.72 || m.d <= 13);
-                            if (!ok) continue;
-                            const rank = m.score * 100 + m.borderScore * 10 - m.d * 0.01;
-                            const hit = {
-                                rank,
-                                dist: m.d,
-                                score: m.score,
-                                cardId: p.student.cardId,
-                                cardNumber: p.student.cardNumber,
-                                student: p.student,
-                                orientation: this.ORIENT[rot],
-                                cx, cy
-                            };
-                            const prev = byCard.get(p.student.cardId);
-                            if (!prev || hit.rank > prev.rank) byCard.set(p.student.cardId, hit);
-                        }
-                    }
+        for (let gy = 0; gy < 4; gy++) {
+            for (let gx = 0; gx < 4; gx++) {
+                const cx = w * (0.14 + gx * 0.24);
+                const cy = h * (0.16 + gy * 0.22);
+                for (const ratio of sizeRatios) {
+                    const boxSize = minSide * ratio;
+                    const sampled = this.sampleGrid(data, w, h, cx, cy, boxSize);
+                    const hit = this.matchAtSample(sampled, patterns);
+                    if (hit) raw.push({ ...hit, cx, cy, boxSize });
                 }
             }
         }
-        return Array.from(byCard.values());
+
+        if (!raw.length) return [];
+
+        raw.sort((a, b) => b.rank - a.rank);
+
+        const accepted = [];
+        for (const hit of raw) {
+            const dup = accepted.some(a =>
+                a.cardId === hit.cardId ||
+                (Math.abs(a.cx - hit.cx) < hit.boxSize * 0.5 && Math.abs(a.cy - hit.cy) < hit.boxSize * 0.5)
+            );
+            if (!dup) accepted.push(hit);
+        }
+        return accepted;
     },
 
     _downscale(src, sw, sh, maxW) {
@@ -454,8 +488,17 @@ const MarkerUtil = {
 const CardScanner = {
     stream: null,
     rafId: null,
-    lastScan: {},
     frameCount: 0,
+    pending: new Map(),
+    confirmed: new Map(),
+    questionKey: null,
+    CONFIRM_FRAMES: 5,
+
+    resetForQuestion(questionId) {
+        this.pending.clear();
+        this.confirmed.clear();
+        this.questionKey = questionId;
+    },
 
     async start(videoEl, canvasEl) {
         try {
@@ -477,7 +520,8 @@ const CardScanner = {
         cancelAnimationFrame(this.rafId);
         this.stream?.getTracks().forEach(t => t.stop());
         this.stream = null;
-        this.lastScan = {};
+        this.pending.clear();
+        this.confirmed.clear();
         this.frameCount = 0;
         appState.cameraReady = false;
     },
@@ -517,19 +561,70 @@ const CardScanner = {
             return;
         }
 
-        // 2) Marker grid — quét full khung, nhiều thẻ cùng lúc
-        if (this.frameCount % 2 === 0) {
-            const hits = MarkerUtil.decodeAll(img.data, img.width, img.height, students);
-            for (const hit of hits) {
-                this._processHit(hit.cardId, hit.orientation, hit.student);
-            }
-            if (hits.length) return;
+        // 2) Marker grid — cần khớp liên tiếp nhiều frame mới ghi nhận
+        if (this.frameCount % 3 !== 0) return;
+
+        const hits = MarkerUtil.decodeAll(img.data, img.width, img.height, students);
+        const seen = new Set();
+
+        for (const hit of hits) {
+            seen.add(hit.cardId);
+            this._trackHit(hit);
         }
 
-        if (this.frameCount % 20 === 0) {
-            $('#scan-hint')?.classList.remove('hidden');
-            $('#scan-hint').textContent = 'Giơ thẻ hướng đáp án lên trên — quét được nhiều em cùng lúc';
+        for (const [cardId, p] of this.pending) {
+            if (!seen.has(cardId)) {
+                p.missed = (p.missed || 0) + 1;
+                if (p.missed >= 2) this.pending.delete(cardId);
+            }
         }
+
+        if (!hits.length && this.frameCount % 30 === 0) {
+            $('#scan-hint')?.classList.remove('hidden');
+            $('#scan-hint').textContent = 'Giơ thẻ — chữ đáp án chọn phải nằm ở trên cùng';
+        } else if (hits.length) {
+            $('#scan-hint')?.classList.add('hidden');
+        }
+    },
+
+    _trackHit(hit) {
+        const q = getCurrentQuestion(appState.session);
+        if (!q) return;
+
+        if (this.questionKey !== q.id) this.resetForQuestion(q.id);
+
+        const confirmKey = `${q.id}_${hit.cardId}`;
+        const already = this.confirmed.get(confirmKey);
+        if (already === hit.orientation) return;
+
+        const existing = appState.session.answers.find(
+            a => a.questionId === q.id && a.studentId === hit.student.id
+        );
+        if (existing?.answer === hit.orientation) {
+            this.confirmed.set(confirmKey, hit.orientation);
+            return;
+        }
+
+        let p = this.pending.get(hit.cardId);
+        if (p && p.orientation === hit.orientation) {
+            p.frames++;
+            p.missed = 0;
+            p.rank = Math.max(p.rank, hit.rank);
+        } else {
+            p = { orientation: hit.orientation, frames: 1, missed: 0, rank: hit.rank, student: hit.student };
+            this.pending.set(hit.cardId, p);
+        }
+
+        if (p.frames >= this.CONFIRM_FRAMES) {
+            this.pending.delete(hit.cardId);
+            this.confirmed.set(confirmKey, hit.orientation);
+            this._fireScan(hit.cardId, hit.orientation, hit.student);
+        }
+    },
+
+    _fireScan(cardId, orientation, knownStudent) {
+        $('#scan-hint')?.classList.add('hidden');
+        onCardScanned(cardId, orientation, knownStudent);
     },
 
     _processQr(code) {
@@ -545,16 +640,8 @@ const CardScanner = {
         if (!cardId) return;
         $('#scan-hint')?.classList.add('hidden');
         const orientation = this._getOrientation(code.location);
-        this._processHit(cardId, orientation);
-    },
-
-    _processHit(cardId, orientation, knownStudent = null) {
-        const key = cardId + orientation;
-        const now = Date.now();
-        if (this.lastScan[key] && now - this.lastScan[key] < 900) return;
-        this.lastScan[key] = now;
-        $('#scan-hint')?.classList.add('hidden');
-        onCardScanned(cardId, orientation, knownStudent);
+        const student = (appState.session?.students || []).find(st => st.cardId === cardId);
+        if (student) this._trackHit({ cardId, orientation, student, rank: 100 });
     },
 
     _getOrientation(loc) {
@@ -602,8 +689,8 @@ function onCardScanned(cardId, orientation, knownStudent = null) {
 
     showScanToast(
         result.updated
-            ? `↻ ${student.name}\nĐã cập nhật: ${orientation}`
-            : `✓ ${student.name}\nThẻ ${String(student.cardNumber).padStart(2, '0')}\nChọn: ${orientation}`,
+            ? `↻ ${student.name} → ${orientation}`
+            : `✓ ${student.name} · ${orientation}`,
         !result.updated
     );
     playSound('scan');
@@ -624,6 +711,10 @@ function renderScanner() {
     if (!s?.questions?.length) return;
 
     const q = getCurrentQuestion(s);
+    if (q && CardScanner.questionKey !== q.id) {
+        CardScanner.resetForQuestion(q.id);
+    }
+
     const answered = getAnswersForQuestion(s, q?.id).filter(a => a.answer);
     const isResult = s.status === SESSION_STATUS.QUESTION_RESULT;
 
