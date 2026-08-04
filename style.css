@@ -69,6 +69,7 @@ body {
     backdrop-filter: blur(4px); font-family: inherit;
 }
 .scan-pill-danger { background: rgba(239,68,68,0.85); margin-left: auto; cursor: pointer; }
+.scan-pill-debug { background: rgba(0,0,0,0.45); color: #94a3b8; font-size: 0.72rem; }
 
 .scan-student-tag {
     position: absolute; bottom: 38%; left: 50%; transform: translateX(-50%);

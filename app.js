@@ -258,28 +258,76 @@ function handleSyncMessage(msg) {
 
 /* ===== MARKER (Plickers-style) — nhận diện thẻ số + hướng A/B/C/D ===== */
 const MarkerUtil = {
-    // rot=0 → A ở trên; rot=1 → D; rot=2 → C; rot=3 → B
-    ORIENT: ['A', 'D', 'C', 'B'],
+    // rot = số lần xoay thuận chiều kim đồng hồ để đưa ảnh về chuẩn
+    ORIENT: ['A', 'B', 'C', 'D'],
 
-    MIN_SCORE: 0.86,
-    MIN_BORDER: 0.90,
-    MAX_DIST: 7,
-    MIN_GAP: 0.06,
+    DATA_CELLS: (() => {
+        const cells = [];
+        for (let r = 1; r <= 5; r++) {
+            for (let c = 1; c <= 5; c++) {
+                if ((r === 1 || r === 5) && (c === 1 || c === 5)) continue;
+                cells.push([r, c]);
+            }
+        }
+        return cells;
+    })(),
+
+    MIN_CODE_DISTANCE: 7,
+    _book: null,
+    _bookSize: 0,
+
+    // Sinh bộ mã sao cho 2 thẻ bất kỳ khác nhau ít nhất 7 ô → chống đọc nhầm
+    buildBook(count) {
+        const bits = this.DATA_CELLS.length;
+        const book = [];
+        let seed = 0x1f2e3d4c >>> 0;
+        const next = () => {
+            seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+            return seed;
+        };
+        let guard = 0;
+        while (book.length < count && guard < 500000) {
+            guard++;
+            const code = new Uint8Array(bits);
+            let ones = 0;
+            for (let i = 0; i < bits; i++) {
+                const b = (next() >>> 18) & 1;
+                code[i] = b;
+                ones += b;
+            }
+            if (ones < 6 || ones > bits - 6) continue;
+            let ok = true;
+            for (const prev of book) {
+                let d = 0;
+                for (let i = 0; i < bits; i++) if (prev[i] !== code[i]) d++;
+                if (d < this.MIN_CODE_DISTANCE) { ok = false; break; }
+            }
+            if (ok) book.push(code);
+        }
+        return book;
+    },
+
+    getCode(cardNumber) {
+        const need = Math.max(60, cardNumber + 10);
+        if (!this._book || this._bookSize < need) {
+            this._book = this.buildBook(need);
+            this._bookSize = need;
+        }
+        const idx = (Math.max(1, cardNumber) - 1) % this._book.length;
+        return this._book[idx];
+    },
 
     getGrid(cardNumber) {
         const grid = Array.from({ length: 7 }, () => Array(7).fill(0));
         for (let i = 0; i < 7; i++) {
             grid[0][i] = grid[6][i] = grid[i][0] = grid[i][6] = 1;
         }
-        let seed = cardNumber * 7919 + 104729;
-        for (let r = 1; r < 6; r++) {
-            for (let c = 1; c < 6; c++) {
-                seed = (seed * 1103515245 + 12345) & 0x7fffffff;
-                grid[r][c] = (seed % 3) !== 0 ? 1 : 0;
-            }
-        }
-        grid[1][1] = grid[1][5] = grid[5][1] = 1;
+        grid[1][1] = 1;
+        grid[1][5] = 0;
+        grid[5][1] = 0;
         grid[5][5] = 0;
+        const code = this.getCode(cardNumber);
+        this.DATA_CELLS.forEach(([r, c], i) => { grid[r][c] = code[i]; });
         return grid;
     },
 
@@ -298,189 +346,266 @@ const MarkerUtil = {
         return g;
     },
 
-    invertGrid(grid) {
-        return grid.map(row => row.map(v => 1 - v));
-    },
-
-    gridMatch(a, b, skipCenter = true) {
-        let d = 0, n = 0, borderD = 0, borderN = 0;
-        for (let r = 0; r < 7; r++) {
-            for (let c = 0; c < 7; c++) {
-                const isBorder = r === 0 || r === 6 || c === 0 || c === 6;
-                if (skipCenter && r >= 2 && r <= 4 && c >= 2 && c <= 4) continue;
-                n++;
-                if (a[r][c] !== b[r][c]) d++;
-                if (isBorder) {
-                    borderN++;
-                    if (a[r][c] !== b[r][c]) borderD++;
-                }
+    toGray(src, sw, sh, maxW) {
+        const scale = Math.min(1, maxW / sw);
+        const w = Math.max(1, Math.round(sw * scale));
+        const h = Math.max(1, Math.round(sh * scale));
+        const gray = new Uint8Array(w * h);
+        for (let y = 0; y < h; y++) {
+            const sy = Math.min(sh - 1, Math.round(y / scale));
+            for (let x = 0; x < w; x++) {
+                const sx = Math.min(sw - 1, Math.round(x / scale));
+                const i = (sy * sw + sx) * 4;
+                gray[y * w + x] = (src[i] * 77 + src[i + 1] * 150 + src[i + 2] * 29) >> 8;
             }
         }
-        return {
-            d,
-            n,
-            score: n ? 1 - d / n : 0,
-            borderScore: borderN ? 1 - borderD / borderN : 0
-        };
+        return { gray, w, h };
     },
 
-    anchorsMatch(a, b) {
-        const pts = [[1, 1], [1, 5], [5, 1], [5, 5]];
-        return pts.every(([r, c]) => a[r][c] === b[r][c]);
-    },
-
-    matchAtSample(sampled, patterns) {
-        let best = null;
-        let second = null;
-
-        for (let rot = 0; rot < 4; rot++) {
-            const rotated = this.rotateGrid(sampled, rot);
-            for (const p of patterns) {
-                const m = this.gridMatch(rotated, p.grid, true);
-                if (m.borderScore < this.MIN_BORDER || m.score < this.MIN_SCORE || m.d > this.MAX_DIST) continue;
-                if (!this.anchorsMatch(rotated, p.grid)) continue;
-
-                const hit = {
-                    rank: m.score * 100 + m.borderScore * 10 - m.d,
-                    dist: m.d,
-                    score: m.score,
-                    borderScore: m.borderScore,
-                    cardId: p.student.cardId,
-                    cardNumber: p.student.cardNumber,
-                    student: p.student,
-                    orientation: this.ORIENT[rot],
-                    rot
-                };
-
-                if (!best || hit.rank > best.rank) {
-                    second = best;
-                    best = hit;
-                } else if (!second || hit.rank > second.rank) {
-                    second = hit;
-                }
+    adaptiveThreshold(gray, w, h) {
+        const iw = w + 1;
+        const integral = new Uint32Array(iw * (h + 1));
+        for (let y = 0; y < h; y++) {
+            let rowSum = 0;
+            for (let x = 0; x < w; x++) {
+                rowSum += gray[y * w + x];
+                integral[(y + 1) * iw + (x + 1)] = integral[y * iw + (x + 1)] + rowSum;
             }
         }
-
-        if (!best) return null;
-        if (second && best.rank - second.rank < this.MIN_GAP * 100) return null;
-        return best;
+        const bin = new Uint8Array(w * h);
+        const half = Math.max(4, Math.round(Math.min(w, h) / 14));
+        for (let y = 0; y < h; y++) {
+            const y0 = Math.max(0, y - half);
+            const y1 = Math.min(h - 1, y + half);
+            for (let x = 0; x < w; x++) {
+                const x0 = Math.max(0, x - half);
+                const x1 = Math.min(w - 1, x + half);
+                const area = (y1 - y0 + 1) * (x1 - x0 + 1);
+                const sum = integral[(y1 + 1) * iw + (x1 + 1)]
+                    - integral[y0 * iw + (x1 + 1)]
+                    - integral[(y1 + 1) * iw + x0]
+                    + integral[y0 * iw + x0];
+                bin[y * w + x] = gray[y * w + x] * area < sum * 0.86 ? 1 : 0;
+            }
+        }
+        return bin;
     },
 
-    sampleGrid(imageData, width, height, cx, cy, boxSize) {
-        const cell = boxSize / 7;
-        const lums = Array.from({ length: 7 }, () => Array(7).fill(128));
+    findQuads(bin, w, h) {
+        const total = w * h;
+        const seen = new Uint8Array(total);
+        const stack = new Int32Array(total);
+        const quads = [];
+        const minArea = Math.max(120, Math.round(total / 6000));
+        const maxArea = Math.round(total * 0.5);
 
-        for (let r = 0; r < 7; r++) {
-            for (let c = 0; c < 7; c++) {
-                const x0 = Math.floor(cx - boxSize / 2 + c * cell + cell * 0.15);
-                const y0 = Math.floor(cy - boxSize / 2 + r * cell + cell * 0.15);
-                const x1 = Math.floor(cx - boxSize / 2 + (c + 1) * cell - cell * 0.15);
-                const y1 = Math.floor(cy - boxSize / 2 + (r + 1) * cell - cell * 0.15);
-                let sum = 0, count = 0;
-                for (let y = y0; y < y1; y++) {
-                    for (let x = x0; x < x1; x++) {
-                        if (x < 0 || y < 0 || x >= width || y >= height) continue;
-                        const i = (y * width + x) * 4;
-                        sum += 0.299 * imageData[i] + 0.587 * imageData[i + 1] + 0.114 * imageData[i + 2];
-                        count++;
+        for (let start = 0; start < total; start++) {
+            if (!bin[start] || seen[start]) continue;
+
+            let sp = 0;
+            stack[sp++] = start;
+            seen[start] = 1;
+
+            let area = 0;
+            let minX = w, maxX = -1, minY = h, maxY = -1;
+            let minSum = Infinity, maxSum = -Infinity, minDiff = Infinity, maxDiff = -Infinity;
+            let pTL = 0, pBR = 0, pBL = 0, pTR = 0;
+
+            while (sp > 0) {
+                const p = stack[--sp];
+                const x = p % w;
+                const y = (p / w) | 0;
+                area++;
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+                const s = x + y;
+                const d = x - y;
+                if (s < minSum) { minSum = s; pTL = p; }
+                if (s > maxSum) { maxSum = s; pBR = p; }
+                if (d < minDiff) { minDiff = d; pBL = p; }
+                if (d > maxDiff) { maxDiff = d; pTR = p; }
+
+                for (let dy = -1; dy <= 1; dy++) {
+                    const ny = y + dy;
+                    if (ny < 0 || ny >= h) continue;
+                    for (let dx = -1; dx <= 1; dx++) {
+                        const nx = x + dx;
+                        if (nx < 0 || nx >= w) continue;
+                        const np = ny * w + nx;
+                        if (bin[np] && !seen[np]) {
+                            seen[np] = 1;
+                            stack[sp++] = np;
+                        }
                     }
                 }
-                lums[r][c] = count ? sum / count : 128;
+            }
+
+            if (area < minArea || area > maxArea) continue;
+
+            const bw = maxX - minX + 1;
+            const bh = maxY - minY + 1;
+            if (bw < 16 || bh < 16) continue;
+            const boxRatio = bw / bh;
+            if (boxRatio < 0.5 || boxRatio > 2.0) continue;
+
+            const pt = p => ({ x: p % w, y: (p / w) | 0 });
+            const quad = [pt(pTL), pt(pTR), pt(pBR), pt(pBL)];
+            if (!this.isSquarish(quad, area)) continue;
+
+            quads.push(quad);
+            if (quads.length >= 64) break;
+        }
+        return quads;
+    },
+
+    isSquarish(quad, area) {
+        const len = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+        const sides = [
+            len(quad[0], quad[1]), len(quad[1], quad[2]),
+            len(quad[2], quad[3]), len(quad[3], quad[0])
+        ];
+        const min = Math.min(...sides);
+        const max = Math.max(...sides);
+        if (min < 14 || min / max < 0.55) return false;
+
+        const quadArea = 0.5 * Math.abs(
+            (quad[0].x * quad[1].y - quad[1].x * quad[0].y) +
+            (quad[1].x * quad[2].y - quad[2].x * quad[1].y) +
+            (quad[2].x * quad[3].y - quad[3].x * quad[2].y) +
+            (quad[3].x * quad[0].y - quad[0].x * quad[3].y)
+        );
+        if (quadArea <= 0) return false;
+        const fill = area / quadArea;
+        return fill > 0.28 && fill < 1.05;
+    },
+
+    samplePerspective(gray, w, h, quad) {
+        const n = 7;
+        const at = (u, v) => {
+            const x = (1 - u) * (1 - v) * quad[0].x + u * (1 - v) * quad[1].x
+                + u * v * quad[2].x + (1 - u) * v * quad[3].x;
+            const y = (1 - u) * (1 - v) * quad[0].y + u * (1 - v) * quad[1].y
+                + u * v * quad[2].y + (1 - u) * v * quad[3].y;
+            const xi = Math.round(x);
+            const yi = Math.round(y);
+            if (xi < 0 || yi < 0 || xi >= w || yi >= h) return -1;
+            return gray[yi * w + xi];
+        };
+
+        const offsets = [[0.5, 0.5], [0.33, 0.33], [0.67, 0.33], [0.33, 0.67], [0.67, 0.67]];
+        const vals = Array.from({ length: n }, () => Array(n).fill(255));
+        for (let r = 0; r < n; r++) {
+            for (let c = 0; c < n; c++) {
+                let sum = 0, count = 0;
+                for (const [ou, ov] of offsets) {
+                    const v = at((c + ou) / n, (r + ov) / n);
+                    if (v >= 0) { sum += v; count++; }
+                }
+                vals[r][c] = count ? sum / count : 255;
             }
         }
+        return vals;
+    },
 
-        const borderVals = [];
+    binarizeCells(vals) {
+        const flat = [];
+        for (const row of vals) for (const v of row) flat.push(v);
+        const min = Math.min(...flat);
+        const max = Math.max(...flat);
+        if (max - min < 35) return null;
+
+        let threshold = (min + max) / 2;
+        let bestVar = -1;
+        for (let t = min + 2; t < max; t += 3) {
+            let sumLo = 0, nLo = 0, sumHi = 0, nHi = 0;
+            for (const v of flat) {
+                if (v < t) { sumLo += v; nLo++; } else { sumHi += v; nHi++; }
+            }
+            if (!nLo || !nHi) continue;
+            const diff = sumLo / nLo - sumHi / nHi;
+            const varB = nLo * nHi * diff * diff;
+            if (varB > bestVar) { bestVar = varB; threshold = t; }
+        }
+        return vals.map(row => row.map(v => (v < threshold ? 1 : 0)));
+    },
+
+    hasBorderRing(grid) {
+        let dark = 0;
         for (let i = 0; i < 7; i++) {
-            borderVals.push(lums[0][i], lums[6][i], lums[i][0], lums[i][6]);
+            dark += grid[0][i] + grid[6][i];
+            if (i > 0 && i < 6) dark += grid[i][0] + grid[i][6];
         }
-        borderVals.sort((a, b) => a - b);
-        const mid = borderVals[Math.floor(borderVals.length / 2)];
-        const innerVals = [];
-        for (let r = 1; r < 6; r++) {
-            for (let c = 1; c < 6; c++) innerVals.push(lums[r][c]);
-        }
-        innerVals.sort((a, b) => a - b);
-        const innerMid = innerVals[Math.floor(innerVals.length / 2)];
-        const threshold = (mid + innerMid) / 2;
-
-        return lums.map(row => row.map(v => (v < threshold ? 1 : 0)));
+        return dark >= 21;
     },
 
-    decode(imageData, width, height, students) {
-        const all = this.decodeAll(imageData, width, height, students);
-        if (!all.length) return null;
-        return all.reduce((a, b) => (a.rank > b.rank ? a : b));
+    matchGrid(sampled, patterns) {
+        for (let rot = 0; rot < 4; rot++) {
+            const g = this.rotateGrid(sampled, rot);
+            if (g[1][1] !== 1 || g[1][5] !== 0 || g[5][1] !== 0 || g[5][5] !== 0) continue;
+
+            let best = null, secondDist = Infinity;
+            for (const p of patterns) {
+                let d = 0;
+                for (const [r, c] of this.DATA_CELLS) {
+                    if (g[r][c] !== p.grid[r][c]) d++;
+                }
+                if (!best || d < best.d) {
+                    secondDist = best ? best.d : secondDist;
+                    best = { d, student: p.student };
+                } else if (d < secondDist) {
+                    secondDist = d;
+                }
+            }
+
+            if (!best || best.d > 3) continue;
+            if (secondDist - best.d < 2) continue;
+
+            return {
+                student: best.student,
+                cardId: best.student.cardId,
+                cardNumber: best.student.cardNumber,
+                orientation: this.ORIENT[rot],
+                dist: best.d
+            };
+        }
+        return null;
     },
+
+    stats: { quads: 0, decoded: 0 },
 
     decodeAll(imageData, width, height, students) {
+        this.stats.quads = 0;
+        this.stats.decoded = 0;
         if (!students?.length) return [];
 
-        let data = imageData;
-        let w = width;
-        let h = height;
-        const maxW = 640;
-        if (width > maxW) {
-            const scaled = this._downscale(imageData, width, height, maxW);
-            data = scaled.data;
-            w = scaled.width;
-            h = scaled.height;
-        }
+        const { gray, w, h } = this.toGray(imageData, width, height, 640);
+        const bin = this.adaptiveThreshold(gray, w, h);
+        const quads = this.findQuads(bin, w, h);
+        this.stats.quads = quads.length;
+        if (!quads.length) return [];
 
         const patterns = students.map(st => ({
             student: st,
             grid: this.getGrid(st.cardNumber)
         }));
 
-        const raw = [];
-        const minSide = Math.min(w, h);
-        const sizeRatios = [0.20, 0.26, 0.32, 0.40];
+        const byCard = new Map();
+        for (const quad of quads) {
+            const vals = this.samplePerspective(gray, w, h, quad);
+            const sampled = this.binarizeCells(vals);
+            if (!sampled || !this.hasBorderRing(sampled)) continue;
 
-        for (let gy = 0; gy < 4; gy++) {
-            for (let gx = 0; gx < 4; gx++) {
-                const cx = w * (0.14 + gx * 0.24);
-                const cy = h * (0.16 + gy * 0.22);
-                for (const ratio of sizeRatios) {
-                    const boxSize = minSide * ratio;
-                    const sampled = this.sampleGrid(data, w, h, cx, cy, boxSize);
-                    const hit = this.matchAtSample(sampled, patterns);
-                    if (hit) raw.push({ ...hit, cx, cy, boxSize });
-                }
-            }
+            const hit = this.matchGrid(sampled, patterns);
+            if (!hit) continue;
+
+            const prev = byCard.get(hit.cardId);
+            if (!prev || hit.dist < prev.dist) byCard.set(hit.cardId, hit);
         }
 
-        if (!raw.length) return [];
-
-        raw.sort((a, b) => b.rank - a.rank);
-
-        const accepted = [];
-        for (const hit of raw) {
-            const dup = accepted.some(a =>
-                a.cardId === hit.cardId ||
-                (Math.abs(a.cx - hit.cx) < hit.boxSize * 0.5 && Math.abs(a.cy - hit.cy) < hit.boxSize * 0.5)
-            );
-            if (!dup) accepted.push(hit);
-        }
-        return accepted;
-    },
-
-    _downscale(src, sw, sh, maxW) {
-        const scale = maxW / sw;
-        const dw = Math.floor(sw * scale);
-        const dh = Math.floor(sh * scale);
-        const out = new Uint8ClampedArray(dw * dh * 4);
-        for (let y = 0; y < dh; y++) {
-            for (let x = 0; x < dw; x++) {
-                const sx = Math.min(sw - 1, Math.floor(x / scale));
-                const sy = Math.min(sh - 1, Math.floor(y / scale));
-                const si = (sy * sw + sx) * 4;
-                const di = (y * dw + x) * 4;
-                out[di] = src[si];
-                out[di + 1] = src[si + 1];
-                out[di + 2] = src[si + 2];
-                out[di + 3] = 255;
-            }
-        }
-        return { data: out, width: dw, height: dh };
+        this.stats.decoded = byCard.size;
+        return Array.from(byCard.values());
     }
 };
 
@@ -492,7 +617,7 @@ const CardScanner = {
     pending: new Map(),
     confirmed: new Map(),
     questionKey: null,
-    CONFIRM_FRAMES: 5,
+    CONFIRM_FRAMES: 2,
 
     resetForQuestion(questionId) {
         this.pending.clear();
@@ -554,14 +679,6 @@ const CardScanner = {
             return;
         }
 
-        // 1) jsQR — QR ở giữa thẻ in PDF
-        const code = jsQR(img.data, img.width, img.height, { inversionAttempts: 'attemptBoth' });
-        if (code?.data) {
-            this._processQr(code);
-            return;
-        }
-
-        // 2) Marker grid — cần khớp liên tiếp nhiều frame mới ghi nhận
         if (this.frameCount % 3 !== 0) return;
 
         const hits = MarkerUtil.decodeAll(img.data, img.width, img.height, students);
@@ -575,15 +692,22 @@ const CardScanner = {
         for (const [cardId, p] of this.pending) {
             if (!seen.has(cardId)) {
                 p.missed = (p.missed || 0) + 1;
-                if (p.missed >= 2) this.pending.delete(cardId);
+                if (p.missed >= 3) this.pending.delete(cardId);
             }
         }
 
-        if (!hits.length && this.frameCount % 30 === 0) {
-            $('#scan-hint')?.classList.remove('hidden');
-            $('#scan-hint').textContent = 'Giơ thẻ — chữ đáp án chọn phải nằm ở trên cùng';
-        } else if (hits.length) {
-            $('#scan-hint')?.classList.add('hidden');
+        const dbg = $('#scan-debug');
+        if (dbg) dbg.textContent = `◻ ${MarkerUtil.stats.quads} · ✓ ${MarkerUtil.stats.decoded}`;
+
+        const hint = $('#scan-hint');
+        if (!hint) return;
+        if (hits.length) {
+            hint.classList.add('hidden');
+        } else if (this.frameCount % 15 === 0) {
+            hint.classList.remove('hidden');
+            hint.textContent = MarkerUtil.stats.quads
+                ? 'Thấy thẻ — đưa gần hơn / giữ thẳng để đọc mã'
+                : 'Giơ thẻ vào khung — chữ đáp án chọn nằm trên cùng';
         }
     },
 
@@ -609,9 +733,8 @@ const CardScanner = {
         if (p && p.orientation === hit.orientation) {
             p.frames++;
             p.missed = 0;
-            p.rank = Math.max(p.rank, hit.rank);
         } else {
-            p = { orientation: hit.orientation, frames: 1, missed: 0, rank: hit.rank, student: hit.student };
+            p = { orientation: hit.orientation, frames: 1, missed: 0, student: hit.student };
             this.pending.set(hit.cardId, p);
         }
 
@@ -625,34 +748,6 @@ const CardScanner = {
     _fireScan(cardId, orientation, knownStudent) {
         $('#scan-hint')?.classList.add('hidden');
         onCardScanned(cardId, orientation, knownStudent);
-    },
-
-    _processQr(code) {
-        const data = code.data.trim();
-        let cardId = null;
-        if (data.startsWith('CARD-')) cardId = data.split('|')[0];
-        else {
-            try {
-                const j = JSON.parse(data);
-                cardId = j.card || j.cardId;
-            } catch (_) {}
-        }
-        if (!cardId) return;
-        $('#scan-hint')?.classList.add('hidden');
-        const orientation = this._getOrientation(code.location);
-        const student = (appState.session?.students || []).find(st => st.cardId === cardId);
-        if (student) this._trackHit({ cardId, orientation, student, rank: 100 });
-    },
-
-    _getOrientation(loc) {
-        const dx = loc.topRightCorner.x - loc.topLeftCorner.x;
-        const dy = loc.topRightCorner.y - loc.topLeftCorner.y;
-        let angle = Math.atan2(dy, dx) * 180 / Math.PI;
-        angle = ((angle % 360) + 360) % 360;
-        if (angle >= 315 || angle < 45) return 'A';
-        if (angle >= 45 && angle < 135) return 'B';
-        if (angle >= 135 && angle < 225) return 'C';
-        return 'D';
     }
 };
 
