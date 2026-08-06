@@ -13,7 +13,11 @@ const appState = {
     sessionId: null,
     session: null,
     soundEnabled: true,
-    cameraReady: false
+    cameraReady: false,
+    cameraStarting: false,
+    sessionDataReady: false,
+    drawerTab: 'pending',
+    lastFlashStudentId: null
 };
 
 function $(sel) { return document.querySelector(sel); }
@@ -224,11 +228,21 @@ function onSessionUpdated() {
 
     if (s.questions?.length && s.students?.length) {
         clearInterval(SyncEngine.statePollTimer);
-        if (!appState.cameraReady) startCamera();
-        else renderScanner();
-        showView('scanner');
+        appState.sessionDataReady = true;
+
+        const meta = $('#camera-prompt-meta');
+        if (meta) {
+            meta.textContent = `${s.className || 'Lớp'} · ${s.students.length} HS · ${s.questions.length} câu`;
+        }
+
+        if (!appState.cameraReady && !appState.cameraStarting) {
+            showView('camera-prompt');
+        } else {
+            showView('scanner');
+            renderScanner();
+        }
     } else {
-        $('#wait-status').textContent = 'Đã kết nối — đang lấy danh sách lớp và câu hỏi...';
+        $('#wait-status').textContent = 'Đã kết nối — đang chờ dữ liệu từ máy chiếu...';
     }
 }
 
@@ -245,6 +259,7 @@ function handleSyncMessage(msg) {
         case 'ANSWER_SCANNED':
         case 'ANSWER_UPDATED':
             if (msg.session) mergeSession(msg.session);
+            else renderScanner();
             break;
         case 'SESSION_COMPLETED':
             if (msg.session) mergeSession(msg.session);
@@ -626,17 +641,25 @@ const CardScanner = {
     },
 
     async start(videoEl, canvasEl) {
+        if (this.stream) return true;
         try {
             this.stream = await navigator.mediaDevices.getUserMedia({
-                video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+                video: {
+                    facingMode: { ideal: 'environment' },
+                    width: { ideal: 1280 },
+                    height: { ideal: 720 }
+                },
+                audio: false
             });
             videoEl.srcObject = this.stream;
+            videoEl.setAttribute('playsinline', 'true');
+            videoEl.muted = true;
             await videoEl.play();
             this._loop(videoEl, canvasEl);
             appState.cameraReady = true;
             return true;
         } catch (e) {
-            showToast('Không mở được camera: ' + e.message);
+            console.warn('Camera error:', e);
             return false;
         }
     },
@@ -670,15 +693,7 @@ const CardScanner = {
 
     _scanFrame(img) {
         const students = appState.session?.students || [];
-
-        if (!students.length) {
-            if (this.frameCount % 45 === 0) {
-                $('#scan-hint')?.classList.remove('hidden');
-                $('#scan-hint').textContent = 'Chưa có danh sách học sinh — mở phiên trên máy tính trước';
-            }
-            return;
-        }
-
+        if (!students.length) return;
         if (this.frameCount % 3 !== 0) return;
 
         const hits = MarkerUtil.decodeAll(img.data, img.width, img.height, students);
@@ -694,20 +709,6 @@ const CardScanner = {
                 p.missed = (p.missed || 0) + 1;
                 if (p.missed >= 3) this.pending.delete(cardId);
             }
-        }
-
-        const dbg = $('#scan-debug');
-        if (dbg) dbg.textContent = `◻ ${MarkerUtil.stats.quads} · ✓ ${MarkerUtil.stats.decoded}`;
-
-        const hint = $('#scan-hint');
-        if (!hint) return;
-        if (hits.length) {
-            hint.classList.add('hidden');
-        } else if (this.frameCount % 15 === 0) {
-            hint.classList.remove('hidden');
-            hint.textContent = MarkerUtil.stats.quads
-                ? 'Thấy thẻ — đưa gần hơn / giữ thẳng để đọc mã'
-                : 'Giơ thẻ vào khung — chữ đáp án chọn nằm trên cùng';
         }
     },
 
@@ -746,7 +747,6 @@ const CardScanner = {
     },
 
     _fireScan(cardId, orientation, knownStudent) {
-        $('#scan-hint')?.classList.add('hidden');
         onCardScanned(cardId, orientation, knownStudent);
     }
 };
@@ -758,7 +758,7 @@ function onCardScanned(cardId, orientation, knownStudent = null) {
 
     const student = knownStudent || s.students.find(st => st.cardId === cardId);
     if (!student) {
-        showScanToast('Không tìm thấy học sinh cho thẻ này', false);
+        showScanFlash('Không tìm thấy thẻ này', true);
         return;
     }
 
@@ -776,29 +776,30 @@ function onCardScanned(cardId, orientation, knownStudent = null) {
         session: getSessionSnapshot()
     });
 
-    const tag = $('#scan-student-tag');
-    tag.textContent = student.name;
-    tag.classList.remove('hidden');
-    clearTimeout(showScanToast._tagT);
-    showScanToast._tagT = setTimeout(() => tag.classList.add('hidden'), 2000);
-
-    showScanToast(
-        result.updated
+    const tag = $('#scan-last-flash');
+    if (tag) {
+        tag.textContent = result.updated
             ? `↻ ${student.name} → ${orientation}`
-            : `✓ ${student.name} · ${orientation}`,
-        !result.updated
-    );
+            : `✓ ${student.name} · ${orientation}`;
+        tag.classList.remove('hidden', 'update');
+        if (result.updated) tag.classList.add('update');
+        appState.lastFlashStudentId = student.id;
+        clearTimeout(showScanFlash._t);
+        showScanFlash._t = setTimeout(() => tag.classList.add('hidden'), 900);
+    }
+
     playSound('scan');
     renderScanner();
 }
 
-function showScanToast(text, success = true) {
-    const el = $('#scan-toast');
+function showScanFlash(text, isUpdate = false) {
+    const el = $('#scan-last-flash');
+    if (!el) return;
     el.textContent = text;
-    el.classList.remove('hidden', 'update');
-    if (!success) el.classList.add('update');
-    clearTimeout(showScanToast._t);
-    showScanToast._t = setTimeout(() => el.classList.add('hidden'), 1200);
+    el.classList.remove('hidden');
+    el.classList.toggle('update', isUpdate);
+    clearTimeout(showScanFlash._t);
+    showScanFlash._t = setTimeout(() => el.classList.add('hidden'), 900);
 }
 
 function renderScanner() {
@@ -810,46 +811,100 @@ function renderScanner() {
         CardScanner.resetForQuestion(q.id);
     }
 
-    const answered = getAnswersForQuestion(s, q?.id).filter(a => a.answer);
+    const answeredList = getAnswersForQuestion(s, q?.id).filter(a => a.answer);
+    const answered = answeredList.length;
+    const total = s.students.length;
+    const pending = total - answered;
+    const pct = total ? Math.round((answered / total) * 100) : 0;
     const isResult = s.status === SESSION_STATUS.QUESTION_RESULT;
 
-    $('#scan-q-pill').textContent = `📋 Câu ${s.currentQuestionIndex + 1}/${s.questions.length}`;
-    $('#scan-count-pill').textContent = `✓ ${answered.length}/${s.students.length}`;
-    $('#scan-answered-count').textContent = `${answered.length}/${s.students.length} đã trả lời`;
+    $('#scan-q-pill').textContent = `Câu ${s.currentQuestionIndex + 1}/${s.questions.length}`;
+    $('#scan-count-pill').textContent = `${answered}/${total}`;
+    $('#scan-progress-fill').style.width = pct + '%';
+    $('#scan-pending-count').textContent = pending;
+    $('#tab-pending-n').textContent = pending;
+    $('#tab-done-n').textContent = answered;
 
-    $('#scanner-active').classList.toggle('hidden', isResult);
-    $('#scanner-result').classList.toggle('hidden', !isResult);
+    const lockBtn = $('#btn-lock-question');
+    if (lockBtn) {
+        lockBtn.classList.toggle('ready', pending === 0 && !isResult);
+        lockBtn.textContent = pending === 0 && !isResult ? '🔒 CHỐT — ĐỦ RỒI!' : '🔒 CHỐT CÂU';
+    }
 
-    $('#scanner-answered-list').innerHTML = s.students.map(st => {
-        const a = s.answers.find(x => x.questionId === q?.id && x.studentId === st.id);
-        const done = a?.answer;
-        return `<span class="answered-chip ${done ? '' : 'pending'}">
-            <span>${esc(st.name)}</span>
-            <strong>${done || '—'}</strong>
-        </span>`;
-    }).join('');
+    const activeDock = $('#scanner-active');
+    const resultDock = $('#scanner-result');
+    if (activeDock) activeDock.classList.toggle('hidden', isResult);
+    if (resultDock) resultDock.classList.toggle('hidden', !isResult);
+
+    renderStudentDrawer(s, q);
 
     if (isResult && q) {
         const stats = getQuestionStats(s, q.id);
-        $('#scan-result-header').innerHTML = `
-            <p>📝 Câu ${s.currentQuestionIndex + 1} / ${s.questions.length}</p>
-            <p>✓ ${answered.length} / ${s.students.length} đã trả lời</p>
-            <p style="color:var(--green);font-weight:700;">✓ Đáp án đúng: ${q.correctAnswer}</p>`;
+        $('#scan-result-summary').textContent = `✓ Đáp án: ${q.correctAnswer} · ${answered}/${total} HS`;
         const max = Math.max(1, ...['A', 'B', 'C', 'D'].map(id => stats.counts[id] || 0));
         $('#scan-result-bars').innerHTML = ['A', 'B', 'C', 'D'].map(id => {
             const n = stats.counts[id] || 0;
-            return `<div class="result-bar-row"><span class="result-bar-label">${id}</span>
+            return `<div class="result-bar-row"><span>${id}${id === q.correctAnswer ? '✓' : ''}</span>
                 <div class="result-bar-track"><div class="result-bar-fill" style="width:${Math.round(n / max * 100)}%"></div></div>
                 <span>${n}</span></div>`;
         }).join('');
     }
 }
 
+function renderStudentDrawer(s, q) {
+    const list = $('#scanner-student-list');
+    if (!list) return;
+
+    const tab = appState.drawerTab;
+    let rows = s.students.map(st => {
+        const a = s.answers.find(x => x.questionId === q?.id && x.studentId === st.id);
+        const done = !!a?.answer;
+        return { st, done, ans: a?.answer || '—' };
+    });
+
+    if (tab === 'pending') rows = rows.filter(r => !r.done);
+    else if (tab === 'done') rows = rows.filter(r => r.done);
+
+    rows.sort((a, b) => {
+        if (a.done !== b.done) return a.done ? 1 : -1;
+        return (a.st.cardNumber || 0) - (b.st.cardNumber || 0);
+    });
+
+    list.innerHTML = rows.length ? rows.map(({ st, done, ans }) => `
+        <div class="scan-student-row ${done ? 'done' : 'pending'}${st.id === appState.lastFlashStudentId ? ' just-scanned' : ''}" data-id="${st.id}">
+            <span>Thẻ ${st.cardNumber} · ${esc(st.name)}</span>
+            <span class="ans-badge">${esc(ans)}</span>
+        </div>
+    `).join('') : `<p style="text-align:center;opacity:0.5;padding:1rem;font-weight:700;">${tab === 'pending' ? '🎉 Tất cả đã quét!' : 'Chưa ai quét'}</p>`;
+}
+
 async function startCamera() {
+    if (appState.cameraReady || appState.cameraStarting) return appState.cameraReady;
+    appState.cameraStarting = true;
+
+    const loading = $('#camera-loading');
+    loading?.classList.remove('hidden');
+
     const video = $('#scanner-video');
     const canvas = $('#scanner-canvas');
-    await CardScanner.start(video, canvas);
-    renderScanner();
+    let ok = false;
+
+    for (let attempt = 0; attempt < 2 && !ok; attempt++) {
+        ok = await CardScanner.start(video, canvas);
+        if (!ok && attempt === 0) await new Promise(r => setTimeout(r, 600));
+    }
+
+    loading?.classList.add('hidden');
+    appState.cameraStarting = false;
+
+    if (ok) {
+        showView('scanner');
+        renderScanner();
+    } else {
+        showToast('Không mở được camera — kiểm tra quyền truy cập');
+        showView('camera-prompt');
+    }
+    return ok;
 }
 
 function confirmLockQuestion() {
@@ -977,10 +1032,42 @@ async function init(sessionId) {
     startReconnectLoop(sessionId);
 }
 
+function showScanMenu() {
+    const s = appState.session;
+    showModal(`
+        <h3>☰ Quản lý quét</h3>
+        <ul class="menu-list">
+            <li><button type="button" id="mm-drawer">👥 Danh sách học sinh</button></li>
+            <li><button type="button" id="mm-choosers">👁 Ai chọn đáp án gì</button></li>
+            <li><button type="button" id="mm-resync">🔄 Đồng bộ lại máy chiếu</button></li>
+            <li><button type="button" class="danger" id="mm-end">🛑 Kết thúc phiên</button></li>
+        </ul>
+        <div class="modal-actions"><button class="btn btn-secondary btn-sm" id="mm-close">Đóng</button></div>
+    `);
+    $('#mm-close').onclick = hideModal;
+    $('#mm-drawer').onclick = () => { hideModal(); $('#scanner-drawer')?.classList.remove('hidden'); };
+    $('#mm-choosers').onclick = () => { hideModal(); showChoosersModal(); };
+    $('#mm-resync').onclick = () => { hideModal(); SyncEngine.requestState(); showToast('Đang đồng bộ...'); };
+    $('#mm-end').onclick = () => { hideModal(); confirmEndSession(); };
+}
+
 function bindEvents() {
+    $('#btn-start-camera')?.addEventListener('click', () => startCamera());
     $('#btn-lock-question')?.addEventListener('click', confirmLockQuestion);
-    $('#btn-end-session-top')?.addEventListener('click', confirmEndSession);
-    $('#btn-toggle-drawer')?.addEventListener('click', () => $('#scanner-drawer')?.classList.toggle('hidden'));
+    $('#btn-scan-menu')?.addEventListener('click', showScanMenu);
+    $('#btn-toggle-drawer')?.addEventListener('click', () => {
+        const d = $('#scanner-drawer');
+        d?.classList.toggle('hidden');
+        if (!d?.classList.contains('hidden')) renderScanner();
+    });
+    $$('.drawer-tab').forEach(btn => {
+        btn.addEventListener('click', () => {
+            $$('.drawer-tab').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            appState.drawerTab = btn.dataset.tab;
+            renderScanner();
+        });
+    });
     $('#btn-next-q-result')?.addEventListener('click', () => {
         SyncEngine.send({ type: 'NEXT_QUESTION' });
         setTimeout(() => SyncEngine.send({ type: 'REQUEST_STATE' }), 400);
@@ -989,6 +1076,13 @@ function bindEvents() {
     $('#btn-show-choosers')?.addEventListener('click', showChoosersModal);
     $('#modal-overlay')?.addEventListener('click', e => {
         if (e.target === $('#modal-overlay')) hideModal();
+    });
+    document.addEventListener('click', e => {
+        const drawer = $('#scanner-drawer');
+        if (drawer && !drawer.classList.contains('hidden') &&
+            !drawer.contains(e.target) && !e.target.closest('#btn-toggle-drawer')) {
+            drawer.classList.add('hidden');
+        }
     });
 }
 
