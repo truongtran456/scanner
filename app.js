@@ -373,6 +373,33 @@ const MarkerUtil = {
         return grid;
     },
 
+    /** Mã thẻ in từ phiên bản presenter cũ — vẫn thử khớp để tương thích */
+    getLegacyGrid(cardNumber) {
+        const grid = Array.from({ length: 7 }, () => Array(7).fill(0));
+        for (let i = 0; i < 7; i++) {
+            grid[0][i] = grid[6][i] = grid[i][0] = grid[i][6] = 1;
+        }
+        let seed = cardNumber * 7919 + 104729;
+        for (let r = 1; r < 6; r++) {
+            for (let c = 1; c < 6; c++) {
+                seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+                grid[r][c] = (seed % 3) !== 0 ? 1 : 0;
+            }
+        }
+        grid[1][1] = grid[1][5] = grid[5][1] = 1;
+        grid[5][5] = 0;
+        return grid;
+    },
+
+    _buildPatterns(students) {
+        const patterns = [];
+        for (const st of students) {
+            patterns.push({ student: st, grid: this.getGrid(st.cardNumber), legacy: false });
+            patterns.push({ student: st, grid: this.getLegacyGrid(st.cardNumber), legacy: true });
+        }
+        return patterns;
+    },
+
     rotateGrid(grid, times) {
         let g = grid.map(row => [...row]);
         for (let t = 0; t < times; t++) {
@@ -585,10 +612,14 @@ const MarkerUtil = {
     matchGrid(sampled, patterns) {
         for (let rot = 0; rot < 4; rot++) {
             const g = this.rotateGrid(sampled, rot);
-            if (g[1][1] !== 1 || g[1][5] !== 0 || g[5][1] !== 0 || g[5][5] !== 0) continue;
+            const modernAnchor = g[1][1] === 1 && g[1][5] === 0 && g[5][1] === 0 && g[5][5] === 0;
+            const legacyAnchor = g[1][1] === 1 && g[1][5] === 1 && g[5][1] === 1 && g[5][5] === 0;
+            if (!modernAnchor && !legacyAnchor) continue;
 
             let best = null, secondDist = Infinity;
             for (const p of patterns) {
+                if (p.legacy && !legacyAnchor) continue;
+                if (!p.legacy && !modernAnchor) continue;
                 let d = 0;
                 for (const [r, c] of this.DATA_CELLS) {
                     if (g[r][c] !== p.grid[r][c]) d++;
@@ -601,8 +632,8 @@ const MarkerUtil = {
                 }
             }
 
-            if (!best || best.d > 3) continue;
-            if (secondDist - best.d < 2) continue;
+            if (!best || best.d > 4) continue;
+            if (secondDist - best.d < 1) continue;
 
             return {
                 student: best.student,
@@ -634,10 +665,7 @@ const MarkerUtil = {
         this.stats.quads = quads.length;
         if (!quads.length) return [];
 
-        const patterns = students.map(st => ({
-            student: st,
-            grid: this.getGrid(st.cardNumber)
-        }));
+        const patterns = this._buildPatterns(students);
 
         const byCard = new Map();
         for (const quad of quads) {
@@ -801,37 +829,47 @@ function updateOrientationUI() {
     $('.wait-orient-tip')?.classList.toggle('portrait-warn', portrait);
 }
 
-function captureScanFrame(video, canvas) {
+function captureScanFrame(video, canvas, ctx) {
     const vw = video.videoWidth;
     const vh = video.videoHeight;
     if (!vw || !vh) return null;
 
-    const rot = ScanOrientation.getFrameRotationDeg();
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const drawCtx = ctx || canvas.getContext('2d', { willReadFrequently: true });
+    const videoLandscape = vw > vh;
+    // Chỉ xoay khung khi video thật sự ngang (tránh xoay nhầm khi cầm dọc)
+    let rot = 0;
+    if (videoLandscape && !IS_IOS && ScanOrientation.isLandscape()) {
+        rot = ScanOrientation.getFrameRotationDeg();
+    }
 
     if (rot === 90 || rot === 270) {
         canvas.width = vh;
         canvas.height = vw;
-        ctx.save();
-        ctx.translate(canvas.width / 2, canvas.height / 2);
-        ctx.rotate(rot * Math.PI / 180);
-        ctx.drawImage(video, -vw / 2, -vh / 2);
-        ctx.restore();
+        drawCtx.save();
+        drawCtx.translate(canvas.width / 2, canvas.height / 2);
+        drawCtx.rotate(rot * Math.PI / 180);
+        drawCtx.drawImage(video, -vw / 2, -vh / 2);
+        drawCtx.restore();
     } else if (rot === 180) {
         canvas.width = vw;
         canvas.height = vh;
-        ctx.save();
-        ctx.translate(canvas.width / 2, canvas.height / 2);
-        ctx.rotate(Math.PI);
-        ctx.drawImage(video, -vw / 2, -vh / 2);
-        ctx.restore();
+        drawCtx.save();
+        drawCtx.translate(canvas.width / 2, canvas.height / 2);
+        drawCtx.rotate(Math.PI);
+        drawCtx.drawImage(video, -vw / 2, -vh / 2);
+        drawCtx.restore();
     } else {
         canvas.width = vw;
         canvas.height = vh;
-        ctx.drawImage(video, 0, 0);
+        drawCtx.drawImage(video, 0, 0);
     }
 
-    return ctx.getImageData(0, 0, canvas.width, canvas.height);
+    return {
+        data: drawCtx.getImageData(0, 0, canvas.width, canvas.height).data,
+        width: canvas.width,
+        height: canvas.height,
+        videoLandscape
+    };
 }
 
 function waitForVideoReady(video, timeoutMs = 10000) {
@@ -870,7 +908,10 @@ const CardScanner = {
     pending: new Map(),
     confirmed: new Map(),
     questionKey: null,
-    CONFIRM_FRAMES: 2,
+    _drawCtx: null,
+    _lastQuads: 0,
+    _lastDecoded: 0,
+    CONFIRM_FRAMES: 1,
 
     _lockKey(questionId, studentId) {
         return `${questionId}_${studentId}`;
@@ -927,8 +968,8 @@ const CardScanner = {
             videoEl.muted = true;
             await videoEl.play();
             await waitForVideoReady(videoEl);
-            this._ensureLoop(videoEl, canvasEl);
             appState.cameraReady = true;
+            this._ensureLoop(videoEl, canvasEl);
             return true;
         } catch (e) {
             console.warn('Camera error:', e);
@@ -948,45 +989,57 @@ const CardScanner = {
     },
 
     _ensureLoop(video, canvas) {
-        cancelAnimationFrame(this.rafId);
-        this.rafId = null;
+        if (this.rafId) return;
         this._loop(video, canvas);
     },
 
     _loop(video, canvas) {
+        if (!this._drawCtx) {
+            this._drawCtx = canvas.getContext('2d', { willReadFrequently: true });
+        }
         const tick = () => {
             this.rafId = requestAnimationFrame(tick);
             if (!this.stream) return;
 
-            if (video.readyState >= video.HAVE_ENOUGH_DATA) {
-                const img = captureScanFrame(video, canvas);
-                if (img) {
-                    this.frameCount++;
-                    if (isScanningAllowed()) this._scanFrame(img);
-                }
-            }
+            const status = appState.session?.status;
+            if (status === SESSION_STATUS.QUESTION_LOCKED ||
+                status === SESSION_STATUS.QUESTION_RESULT) return;
+
+            if (video.readyState < video.HAVE_ENOUGH_DATA) return;
+            if (!video.videoWidth || !video.videoHeight) return;
+
+            const frame = captureScanFrame(video, canvas, this._drawCtx);
+            if (!frame) return;
+
+            this.frameCount++;
+            this._scanFrame(frame);
         };
         tick();
     },
 
-    _scanFrame(img) {
+    _scanFrame(frame) {
         const students = appState.session?.students || [];
         if (!students.length) return;
         if (this.frameCount % 2 !== 0) return;
 
-        const offset = ScanOrientation.getOrientOffset();
-        let hits = MarkerUtil.decodeAll(img.data, img.width, img.height, students);
+        const offset = (frame.videoLandscape && ScanOrientation.isLandscape())
+            ? ScanOrientation.getOrientOffset() : 0;
+
+        let hits = MarkerUtil.decodeAll(frame.data, frame.width, frame.height, students);
+        this._lastQuads = MarkerUtil.stats.quads;
+        this._lastDecoded = MarkerUtil.stats.decoded;
+
         if (offset) {
             hits = hits.map(h => ({
                 ...h,
                 orientation: MarkerUtil.correctOrientation(h.orientation, offset)
             }));
         }
-        const seen = new Set();
 
         const q = getCurrentQuestion(appState.session);
+        const seen = new Set();
         for (const hit of hits) {
-            if (this.isStudentLocked(hit.student.id, q?.id)) continue;
+            if (q && this.isStudentLocked(hit.student.id, q.id)) continue;
             seen.add(hit.cardId);
             this._trackHit(hit);
         }
@@ -994,20 +1047,26 @@ const CardScanner = {
         for (const [cardId, p] of this.pending) {
             if (!seen.has(cardId)) {
                 p.missed = (p.missed || 0) + 1;
-                if (p.missed >= 3) this.pending.delete(cardId);
+                if (p.missed >= 4) this.pending.delete(cardId);
+            }
+        }
+
+        if (hits.length) {
+            const tip = $('#scan-frame-tip');
+            if (tip && isScanningAllowed()) {
+                tip.textContent = `Đang nhận ${hits.length} thẻ...`;
             }
         }
     },
 
     _trackHit(hit) {
         const q = getCurrentQuestion(appState.session);
-        if (!q || !isScanningAllowed()) return;
+        if (!q) return;
 
         if (this.questionKey !== q.id) this.resetForQuestion(q.id);
 
         const confirmKey = this._lockKey(q.id, hit.student.id);
         if (this.isStudentLocked(hit.student.id, q.id)) {
-            this.confirmed.set(confirmKey, getStudentAnswer(appState.session, q.id, hit.student.id)?.answer || true);
             this.pending.delete(hit.cardId);
             return;
         }
@@ -1090,8 +1149,6 @@ function renderScanner() {
     const q = getCurrentQuestion(s);
     if (q && CardScanner.questionKey !== q.id) {
         CardScanner.resetForQuestion(q.id);
-    } else if (q) {
-        CardScanner._seedConfirmedFromAnswers();
     }
 
     const answeredList = getAnswersForQuestion(s, q?.id).filter(a => a.answer);
@@ -1185,7 +1242,7 @@ async function startCamera() {
         if (ok) {
             await waitForVideoReady(video);
             await video.play().catch(() => {});
-            CardScanner._ensureLoop(video, canvas);
+            if (!CardScanner.rafId) CardScanner._ensureLoop(video, canvas);
         }
         if (!ok && attempt === 0) await new Promise(r => setTimeout(r, 600));
     }
