@@ -834,6 +834,34 @@ function captureScanFrame(video, canvas) {
     return ctx.getImageData(0, 0, canvas.width, canvas.height);
 }
 
+function waitForVideoReady(video, timeoutMs = 10000) {
+    if (video.videoWidth > 0 && video.videoHeight > 0) return Promise.resolve(true);
+    return new Promise(resolve => {
+        const deadline = Date.now() + timeoutMs;
+        let done = false;
+        const finish = (ok) => {
+            if (done) return;
+            done = true;
+            video.removeEventListener('loadedmetadata', onReady);
+            video.removeEventListener('loadeddata', onReady);
+            video.removeEventListener('resize', onReady);
+            resolve(ok);
+        };
+        const onReady = () => {
+            if (video.videoWidth > 0 && video.videoHeight > 0) finish(true);
+        };
+        video.addEventListener('loadedmetadata', onReady);
+        video.addEventListener('loadeddata', onReady);
+        video.addEventListener('resize', onReady);
+        const poll = () => {
+            if (video.videoWidth > 0 && video.videoHeight > 0) return finish(true);
+            if (Date.now() > deadline) return finish(false);
+            requestAnimationFrame(poll);
+        };
+        poll();
+    });
+}
+
 /* ===== CARD SCANNER ===== */
 const CardScanner = {
     stream: null,
@@ -898,6 +926,7 @@ const CardScanner = {
             videoEl.setAttribute('playsinline', 'true');
             videoEl.muted = true;
             await videoEl.play();
+            await waitForVideoReady(videoEl);
             this._ensureLoop(videoEl, canvasEl);
             appState.cameraReady = true;
             return true;
@@ -919,7 +948,8 @@ const CardScanner = {
     },
 
     _ensureLoop(video, canvas) {
-        if (this.rafId) return;
+        cancelAnimationFrame(this.rafId);
+        this.rafId = null;
         this._loop(video, canvas);
     },
 
@@ -928,21 +958,20 @@ const CardScanner = {
             this.rafId = requestAnimationFrame(tick);
             if (!this.stream) return;
 
-            if (video.readyState >= video.HAVE_ENOUGH_DATA && isScanningAllowed()) {
+            if (video.readyState >= video.HAVE_ENOUGH_DATA) {
                 const img = captureScanFrame(video, canvas);
                 if (img) {
                     this.frameCount++;
-                    this._scanFrame(img);
+                    if (isScanningAllowed()) this._scanFrame(img);
                 }
             }
         };
-        cancelAnimationFrame(this.rafId);
         tick();
     },
 
     _scanFrame(img) {
         const students = appState.session?.students || [];
-        if (!students.length || !isScanningAllowed()) return;
+        if (!students.length) return;
         if (this.frameCount % 2 !== 0) return;
 
         const offset = ScanOrientation.getOrientOffset();
@@ -1139,6 +1168,9 @@ async function startCamera() {
 
     appState.cameraStarting = true;
 
+    // Hiện màn quét TRƯỚC — iOS không cấp kích thước video khi thẻ bị display:none
+    showView('scanner');
+
     const loading = $('#camera-loading');
     loading?.classList.remove('hidden');
 
@@ -1146,8 +1178,15 @@ async function startCamera() {
     const canvas = $('#scanner-canvas');
     let ok = false;
 
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
     for (let attempt = 0; attempt < 2 && !ok; attempt++) {
         ok = await CardScanner.start(video, canvas);
+        if (ok) {
+            await waitForVideoReady(video);
+            await video.play().catch(() => {});
+            CardScanner._ensureLoop(video, canvas);
+        }
         if (!ok && attempt === 0) await new Promise(r => setTimeout(r, 600));
     }
 
@@ -1155,7 +1194,6 @@ async function startCamera() {
     appState.cameraStarting = false;
 
     if (ok) {
-        showView('scanner');
         updateOrientationUI();
         renderScanner();
         if (!ScanOrientation.isLandscape()) {
