@@ -706,14 +706,10 @@ const ScanOrientation = {
         const was = this._landscape;
         this._read();
         updateOrientationUI();
-        if (was !== this._landscape) {
-            if (this._landscape) {
-                showToast('✓ Đã xoay ngang — bấm Bật camera để quét', 2800);
-            } else {
-                showToast('⚠ Xoay ngang máy để quét!', 3500);
-            }
-            this._onChange?.(was);
+        if (was !== this._landscape && this._landscape && appState.cameraReady) {
+            showToast('💡 Xoay ngang giúp quét chính xác hơn', 2500);
         }
+        if (was !== this._landscape) this._onChange?.(was);
     },
 
     isLandscape() {
@@ -738,7 +734,7 @@ function isScanningAllowed() {
     if (!s || !appState.cameraReady) return false;
     if (s.status === SESSION_STATUS.QUESTION_LOCKED ||
         s.status === SESSION_STATUS.QUESTION_RESULT) return false;
-    return ScanOrientation.isLandscape();
+    return true;
 }
 
 function updateOrientationUI() {
@@ -753,25 +749,29 @@ function updateOrientationUI() {
     view?.classList.toggle('scan-landscape', landscape);
     view?.classList.toggle('scan-portrait-mode', portrait && appState.cameraReady);
 
-    const showBlock = portrait && appState.cameraReady;
-    $('#orientation-prompt')?.classList.toggle('hidden', !showBlock);
-    $('#scan-portrait-banner')?.classList.toggle('hidden', !showBlock);
+    const showHint = portrait && appState.cameraReady;
+    $('#orientation-prompt')?.classList.add('hidden');
+    $('#scan-portrait-banner')?.classList.toggle('hidden', !showHint);
 
     const orientPill = $('#scan-orient-pill');
     if (orientPill) {
         if (!appState.cameraReady) {
             orientPill.textContent = '—';
             orientPill.classList.remove('landscape', 'portrait');
-        } else if (scanning) {
+        } else if (scanning && landscape) {
             orientPill.textContent = 'QUÉT ✓';
             orientPill.classList.add('landscape');
             orientPill.classList.remove('portrait');
+        } else if (scanning && portrait) {
+            orientPill.textContent = 'DỌC';
+            orientPill.classList.add('portrait');
+            orientPill.classList.remove('landscape');
         } else if (portrait) {
-            orientPill.textContent = 'DỌC ⛔';
+            orientPill.textContent = 'DỌC';
             orientPill.classList.add('portrait');
             orientPill.classList.remove('landscape');
         } else {
-            orientPill.textContent = 'CHỜ';
+            orientPill.textContent = 'NGANG';
             orientPill.classList.add('landscape');
             orientPill.classList.remove('portrait');
         }
@@ -780,20 +780,18 @@ function updateOrientationUI() {
     const tip = $('#scan-frame-tip');
     if (tip) {
         if (!appState.cameraReady) tip.textContent = 'Bật camera để quét';
-        else if (scanning) tip.textContent = 'Giơ thẻ dọc — đáp án ở trên cùng';
-        else if (portrait) tip.textContent = '⛔ Xoay ngang máy để quét';
-        else tip.textContent = 'Chờ câu hỏi mới...';
+        else if (!scanning) tip.textContent = 'Chờ câu hỏi mới...';
+        else if (portrait) tip.textContent = '💡 Gợi ý: xoay ngang máy để quét chính xác hơn';
+        else tip.textContent = 'Giơ thẻ dọc — đáp án ở trên cùng';
     }
 
     const camBlock = $('#camera-portrait-block');
     const camBtn = $('#btn-start-camera');
     const onCameraPrompt = $('#view-camera-prompt')?.classList.contains('active');
-    camBlock?.classList.toggle('hidden', landscape || !onCameraPrompt);
+    camBlock?.classList.toggle('hidden', !portrait || !onCameraPrompt);
     if (camBtn) {
-        camBtn.disabled = portrait;
-        camBtn.textContent = landscape
-            ? '▶ Bật camera & quét'
-            : '▶ Xoay ngang trước (nút sẽ sáng)';
+        camBtn.disabled = false;
+        camBtn.textContent = '▶ Bật camera & quét';
     }
 
     $('#view-camera-prompt')?.classList.toggle('prompt-landscape', landscape);
@@ -834,24 +832,6 @@ function captureScanFrame(video, canvas) {
     }
 
     return ctx.getImageData(0, 0, canvas.width, canvas.height);
-}
-
-function showLandscapeRequiredModal() {
-    showModal(`
-        <div style="text-align:center">
-            <div style="font-size:3rem;margin-bottom:0.5rem">📱↻</div>
-            <h3>Xoay ngang máy trước!</h3>
-            <p style="margin:0.75rem 0;line-height:1.55;font-weight:600;color:rgba(255,255,255,0.75)">
-                Thẻ có <strong style="color:var(--orange)">4 hướng = 4 đáp án</strong>.<br>
-                Quét khi cầm điện thoại <strong style="color:var(--red)">dọc sẽ sai</strong>.<br>
-                Hãy xoay ngang rồi thử lại.
-            </p>
-        </div>
-        <div class="modal-actions" style="justify-content:center">
-            <button class="btn btn-primary" id="mc-landscape-ok">Đã hiểu</button>
-        </div>
-    `);
-    $('#mc-landscape-ok').onclick = hideModal;
 }
 
 /* ===== CARD SCANNER ===== */
@@ -963,7 +943,7 @@ const CardScanner = {
     _scanFrame(img) {
         const students = appState.session?.students || [];
         if (!students.length || !isScanningAllowed()) return;
-        if (this.frameCount % 3 !== 0) return;
+        if (this.frameCount % 2 !== 0) return;
 
         const offset = ScanOrientation.getOrientOffset();
         let hits = MarkerUtil.decodeAll(img.data, img.width, img.height, students);
@@ -1157,12 +1137,6 @@ function renderStudentDrawer(s, q) {
 async function startCamera() {
     if (appState.cameraReady || appState.cameraStarting) return appState.cameraReady;
 
-    if (!ScanOrientation.isLandscape()) {
-        showLandscapeRequiredModal();
-        updateOrientationUI();
-        return false;
-    }
-
     appState.cameraStarting = true;
 
     const loading = $('#camera-loading');
@@ -1184,6 +1158,9 @@ async function startCamera() {
         showView('scanner');
         updateOrientationUI();
         renderScanner();
+        if (!ScanOrientation.isLandscape()) {
+            showToast('💡 Gợi ý: xoay ngang để quét chính xác hơn', 3200);
+        }
     } else {
         showToast('Không mở được camera — kiểm tra quyền truy cập');
         showView('camera-prompt');
