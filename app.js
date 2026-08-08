@@ -664,24 +664,42 @@ const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
 const ScanOrientation = {
     _landscape: false,
     _type: 'portrait-primary',
+    _landscapeMq: null,
 
     init(onChange) {
         this._onChange = onChange;
+        this._landscapeMq = window.matchMedia('(orientation: landscape)');
         this._read();
         const fire = () => setTimeout(() => this._handleChange(), 100);
         window.addEventListener('orientationchange', fire);
         window.addEventListener('resize', fire);
+        window.visualViewport?.addEventListener('resize', fire);
+        this._landscapeMq.addEventListener?.('change', fire);
+        this._landscapeMq.addListener?.(fire);
         if (screen.orientation) screen.orientation.addEventListener('change', fire);
         this._handleChange();
     },
 
     _read() {
-        // screen.width/height ổn định trên iPhone hơn visualViewport
-        const sw = window.screen.width;
-        const sh = window.screen.height;
-        this._landscape = sw > sh;
+        const iw = window.innerWidth;
+        const ih = window.innerHeight;
         const t = screen.orientation?.type;
-        this._type = t || (this._landscape ? 'landscape-primary' : 'portrait-primary');
+
+        // KHÔNG dùng screen.width/height — trên iPhone không đổi khi xoay!
+        if (t?.startsWith('landscape')) {
+            this._landscape = true;
+            this._type = t;
+        } else if (t?.startsWith('portrait')) {
+            this._landscape = false;
+            this._type = t;
+        } else {
+            this._landscape = iw > ih;
+            this._type = this._landscape ? 'landscape-primary' : 'portrait-primary';
+        }
+
+        // Fallback viewport (iOS Safari luôn đổi innerWidth khi xoay)
+        if (iw > ih) this._landscape = true;
+        if (ih > iw && !t?.startsWith('landscape')) this._landscape = false;
     },
 
     _handleChange() {
@@ -689,7 +707,9 @@ const ScanOrientation = {
         this._read();
         updateOrientationUI();
         if (was !== this._landscape) {
-            if (!this._landscape) {
+            if (this._landscape) {
+                showToast('✓ Đã xoay ngang — bấm Bật camera để quét', 2800);
+            } else {
                 showToast('⚠ Xoay ngang máy để quét!', 3500);
             }
             this._onChange?.(was);
@@ -767,13 +787,18 @@ function updateOrientationUI() {
 
     const camBlock = $('#camera-portrait-block');
     const camBtn = $('#btn-start-camera');
-    camBlock?.classList.toggle('hidden', landscape);
+    const onCameraPrompt = $('#view-camera-prompt')?.classList.contains('active');
+    camBlock?.classList.toggle('hidden', landscape || !onCameraPrompt);
     if (camBtn) {
         camBtn.disabled = portrait;
         camBtn.textContent = landscape
             ? '▶ Bật camera & quét'
-            : '▶ Xoay ngang trước';
+            : '▶ Xoay ngang trước (nút sẽ sáng)';
     }
+
+    $('#view-camera-prompt')?.classList.toggle('prompt-landscape', landscape);
+    $('#view-camera-prompt')?.classList.toggle('prompt-portrait', portrait && onCameraPrompt);
+    $('#view-waiting')?.classList.toggle('prompt-landscape', landscape);
 
     $('.wait-orient-tip')?.classList.toggle('portrait-warn', portrait);
 }
