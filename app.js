@@ -154,6 +154,12 @@ function uid(prefix = 'id') {
     return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
+function getStudentAnswer(session, questionId, studentId) {
+    return session?.answers?.find(
+        a => a.questionId === questionId && a.studentId === studentId
+    );
+}
+
 function recordAnswer(session, studentId, cardId, answer) {
     const q = getCurrentQuestion(session);
     if (!q || session.status === SESSION_STATUS.QUESTION_LOCKED ||
@@ -162,6 +168,10 @@ function recordAnswer(session, studentId, cardId, answer) {
     if (!session.answers) session.answers = [];
 
     const existingIdx = getAnswerKey(session, q.id, studentId);
+    if (existingIdx >= 0 && session.answers[existingIdx].answer) {
+        return { ok: false, locked: true };
+    }
+
     const record = {
         id: uid('ans'),
         sessionId: session.id,
@@ -173,14 +183,12 @@ function recordAnswer(session, studentId, cardId, answer) {
         submittedAt: Date.now()
     };
 
-    let updated = false;
     if (existingIdx >= 0) {
         session.answers[existingIdx] = { ...session.answers[existingIdx], answer, submittedAt: Date.now() };
-        updated = true;
     } else {
         session.answers.push(record);
     }
-    return { ok: true, updated };
+    return { ok: true };
 }
 
 function getQuestionStats(session, questionId) {
@@ -237,8 +245,10 @@ function onSessionUpdated() {
 
         if (!appState.cameraReady && !appState.cameraStarting) {
             showView('camera-prompt');
+            updateOrientationUI();
         } else {
             showView('scanner');
+            updateOrientationUI();
             renderScanner();
         }
     } else {
@@ -248,6 +258,9 @@ function onSessionUpdated() {
 
 function handleSyncMessage(msg) {
     if (!msg?.type) return;
+
+    const prevQIdx = appState.session?.currentQuestionIndex;
+    const prevStatus = appState.session?.status;
 
     switch (msg.type) {
         case 'STATE_SYNC':
@@ -268,6 +281,20 @@ function handleSyncMessage(msg) {
                 onSessionUpdated();
             }
             break;
+    }
+
+    const s = appState.session;
+    const q = getCurrentQuestion(s);
+    const qChanged = s && (s.currentQuestionIndex !== prevQIdx || s.status !== prevStatus);
+    if (qChanged && q && (
+        msg.type === 'NEXT_QUESTION' ||
+        msg.type === 'QUESTION_CHANGED' ||
+        msg.type === 'STATE_SYNC' ||
+        msg.type === 'QUESTION_RESULT'
+    )) {
+        CardScanner.onQuestionChanged(q.id);
+    } else if (qChanged) {
+        updateOrientationUI();
     }
 }
 
@@ -590,6 +617,12 @@ const MarkerUtil = {
 
     stats: { quads: 0, decoded: 0 },
 
+    correctOrientation(letter, offset) {
+        const i = this.ORIENT.indexOf(letter);
+        if (i < 0 || !offset) return letter;
+        return this.ORIENT[(i + offset) % 4];
+    },
+
     decodeAll(imageData, width, height, students) {
         this.stats.quads = 0;
         this.stats.decoded = 0;
@@ -624,6 +657,178 @@ const MarkerUtil = {
     }
 };
 
+/* ===== HƯỚNG MÀN HÌNH ===== */
+const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
+    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+const ScanOrientation = {
+    _landscape: false,
+    _type: 'portrait-primary',
+
+    init(onChange) {
+        this._onChange = onChange;
+        this._read();
+        const fire = () => setTimeout(() => this._handleChange(), 100);
+        window.addEventListener('orientationchange', fire);
+        window.addEventListener('resize', fire);
+        if (screen.orientation) screen.orientation.addEventListener('change', fire);
+        this._handleChange();
+    },
+
+    _read() {
+        // screen.width/height ổn định trên iPhone hơn visualViewport
+        const sw = window.screen.width;
+        const sh = window.screen.height;
+        this._landscape = sw > sh;
+        const t = screen.orientation?.type;
+        this._type = t || (this._landscape ? 'landscape-primary' : 'portrait-primary');
+    },
+
+    _handleChange() {
+        const was = this._landscape;
+        this._read();
+        updateOrientationUI();
+        if (was !== this._landscape) {
+            if (!this._landscape) {
+                showToast('⚠ Xoay ngang máy để quét!', 3500);
+            }
+            this._onChange?.(was);
+        }
+    },
+
+    isLandscape() {
+        return this._landscape;
+    },
+
+    /** Bù đáp án theo hướng cầm máy (chỉ khi quét ngang) */
+    getOrientOffset() {
+        if (!this._landscape) return 0;
+        if (IS_IOS) return this._type === 'landscape-secondary' ? 1 : 3;
+        return 0;
+    },
+
+    getFrameRotationDeg() {
+        if (!this._landscape || IS_IOS) return 0;
+        return this._type === 'landscape-secondary' ? 90 : 270;
+    }
+};
+
+function isScanningAllowed() {
+    const s = appState.session;
+    if (!s || !appState.cameraReady) return false;
+    if (s.status === SESSION_STATUS.QUESTION_LOCKED ||
+        s.status === SESSION_STATUS.QUESTION_RESULT) return false;
+    return ScanOrientation.isLandscape();
+}
+
+function updateOrientationUI() {
+    const landscape = ScanOrientation.isLandscape();
+    const portrait = !landscape;
+    const scanning = isScanningAllowed();
+
+    document.body.classList.toggle('portrait-mode', portrait);
+    document.body.classList.toggle('landscape-mode', landscape);
+
+    const view = $('#view-scanner');
+    view?.classList.toggle('scan-landscape', landscape);
+    view?.classList.toggle('scan-portrait-mode', portrait && appState.cameraReady);
+
+    const showBlock = portrait && appState.cameraReady;
+    $('#orientation-prompt')?.classList.toggle('hidden', !showBlock);
+    $('#scan-portrait-banner')?.classList.toggle('hidden', !showBlock);
+
+    const orientPill = $('#scan-orient-pill');
+    if (orientPill) {
+        if (!appState.cameraReady) {
+            orientPill.textContent = '—';
+            orientPill.classList.remove('landscape', 'portrait');
+        } else if (scanning) {
+            orientPill.textContent = 'QUÉT ✓';
+            orientPill.classList.add('landscape');
+            orientPill.classList.remove('portrait');
+        } else if (portrait) {
+            orientPill.textContent = 'DỌC ⛔';
+            orientPill.classList.add('portrait');
+            orientPill.classList.remove('landscape');
+        } else {
+            orientPill.textContent = 'CHỜ';
+            orientPill.classList.add('landscape');
+            orientPill.classList.remove('portrait');
+        }
+    }
+
+    const tip = $('#scan-frame-tip');
+    if (tip) {
+        if (!appState.cameraReady) tip.textContent = 'Bật camera để quét';
+        else if (scanning) tip.textContent = 'Giơ thẻ dọc — đáp án ở trên cùng';
+        else if (portrait) tip.textContent = '⛔ Xoay ngang máy để quét';
+        else tip.textContent = 'Chờ câu hỏi mới...';
+    }
+
+    const camBlock = $('#camera-portrait-block');
+    const camBtn = $('#btn-start-camera');
+    camBlock?.classList.toggle('hidden', landscape);
+    if (camBtn) {
+        camBtn.disabled = portrait;
+        camBtn.textContent = landscape
+            ? '▶ Bật camera & quét'
+            : '▶ Xoay ngang trước';
+    }
+
+    $('.wait-orient-tip')?.classList.toggle('portrait-warn', portrait);
+}
+
+function captureScanFrame(video, canvas) {
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!vw || !vh) return null;
+
+    const rot = ScanOrientation.getFrameRotationDeg();
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+    if (rot === 90 || rot === 270) {
+        canvas.width = vh;
+        canvas.height = vw;
+        ctx.save();
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.rotate(rot * Math.PI / 180);
+        ctx.drawImage(video, -vw / 2, -vh / 2);
+        ctx.restore();
+    } else if (rot === 180) {
+        canvas.width = vw;
+        canvas.height = vh;
+        ctx.save();
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.rotate(Math.PI);
+        ctx.drawImage(video, -vw / 2, -vh / 2);
+        ctx.restore();
+    } else {
+        canvas.width = vw;
+        canvas.height = vh;
+        ctx.drawImage(video, 0, 0);
+    }
+
+    return ctx.getImageData(0, 0, canvas.width, canvas.height);
+}
+
+function showLandscapeRequiredModal() {
+    showModal(`
+        <div style="text-align:center">
+            <div style="font-size:3rem;margin-bottom:0.5rem">📱↻</div>
+            <h3>Xoay ngang máy trước!</h3>
+            <p style="margin:0.75rem 0;line-height:1.55;font-weight:600;color:rgba(255,255,255,0.75)">
+                Thẻ có <strong style="color:var(--orange)">4 hướng = 4 đáp án</strong>.<br>
+                Quét khi cầm điện thoại <strong style="color:var(--red)">dọc sẽ sai</strong>.<br>
+                Hãy xoay ngang rồi thử lại.
+            </p>
+        </div>
+        <div class="modal-actions" style="justify-content:center">
+            <button class="btn btn-primary" id="mc-landscape-ok">Đã hiểu</button>
+        </div>
+    `);
+    $('#mc-landscape-ok').onclick = hideModal;
+}
+
 /* ===== CARD SCANNER ===== */
 const CardScanner = {
     stream: null,
@@ -634,14 +839,47 @@ const CardScanner = {
     questionKey: null,
     CONFIRM_FRAMES: 2,
 
+    _lockKey(questionId, studentId) {
+        return `${questionId}_${studentId}`;
+    },
+
     resetForQuestion(questionId) {
         this.pending.clear();
         this.confirmed.clear();
         this.questionKey = questionId;
+        this.frameCount = 0;
+        this._seedConfirmedFromAnswers();
+    },
+
+    _seedConfirmedFromAnswers() {
+        const s = appState.session;
+        const q = getCurrentQuestion(s);
+        if (!s || !q) return;
+        for (const st of s.students || []) {
+            const ans = getStudentAnswer(s, q.id, st.id);
+            if (ans?.answer) this.confirmed.set(this._lockKey(q.id, st.id), ans.answer);
+        }
+    },
+
+    isStudentLocked(studentId, questionId) {
+        if (!questionId || !studentId) return false;
+        if (this.confirmed.has(this._lockKey(questionId, studentId))) return true;
+        const s = appState.session;
+        return !!getStudentAnswer(s, questionId, studentId)?.answer;
+    },
+
+    onQuestionChanged(questionId) {
+        if (questionId) this.resetForQuestion(questionId);
+        const video = $('#scanner-video');
+        if (video?.srcObject) video.play().catch(() => {});
+        updateOrientationUI();
     },
 
     async start(videoEl, canvasEl) {
-        if (this.stream) return true;
+        if (this.stream) {
+            this._ensureLoop(videoEl, canvasEl);
+            return true;
+        }
         try {
             this.stream = await navigator.mediaDevices.getUserMedia({
                 video: {
@@ -655,7 +893,7 @@ const CardScanner = {
             videoEl.setAttribute('playsinline', 'true');
             videoEl.muted = true;
             await videoEl.play();
-            this._loop(videoEl, canvasEl);
+            this._ensureLoop(videoEl, canvasEl);
             appState.cameraReady = true;
             return true;
         } catch (e) {
@@ -666,6 +904,7 @@ const CardScanner = {
 
     stop() {
         cancelAnimationFrame(this.rafId);
+        this.rafId = null;
         this.stream?.getTracks().forEach(t => t.stop());
         this.stream = null;
         this.pending.clear();
@@ -674,32 +913,46 @@ const CardScanner = {
         appState.cameraReady = false;
     },
 
+    _ensureLoop(video, canvas) {
+        if (this.rafId) return;
+        this._loop(video, canvas);
+    },
+
     _loop(video, canvas) {
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
         const tick = () => {
-            if (!this.stream) return;
-            if (video.readyState === video.HAVE_ENOUGH_DATA) {
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-                ctx.drawImage(video, 0, 0);
-                const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                this.frameCount++;
-                this._scanFrame(img);
-            }
             this.rafId = requestAnimationFrame(tick);
+            if (!this.stream) return;
+
+            if (video.readyState >= video.HAVE_ENOUGH_DATA && isScanningAllowed()) {
+                const img = captureScanFrame(video, canvas);
+                if (img) {
+                    this.frameCount++;
+                    this._scanFrame(img);
+                }
+            }
         };
+        cancelAnimationFrame(this.rafId);
         tick();
     },
 
     _scanFrame(img) {
         const students = appState.session?.students || [];
-        if (!students.length) return;
+        if (!students.length || !isScanningAllowed()) return;
         if (this.frameCount % 3 !== 0) return;
 
-        const hits = MarkerUtil.decodeAll(img.data, img.width, img.height, students);
+        const offset = ScanOrientation.getOrientOffset();
+        let hits = MarkerUtil.decodeAll(img.data, img.width, img.height, students);
+        if (offset) {
+            hits = hits.map(h => ({
+                ...h,
+                orientation: MarkerUtil.correctOrientation(h.orientation, offset)
+            }));
+        }
         const seen = new Set();
 
+        const q = getCurrentQuestion(appState.session);
         for (const hit of hits) {
+            if (this.isStudentLocked(hit.student.id, q?.id)) continue;
             seen.add(hit.cardId);
             this._trackHit(hit);
         }
@@ -714,19 +967,14 @@ const CardScanner = {
 
     _trackHit(hit) {
         const q = getCurrentQuestion(appState.session);
-        if (!q) return;
+        if (!q || !isScanningAllowed()) return;
 
         if (this.questionKey !== q.id) this.resetForQuestion(q.id);
 
-        const confirmKey = `${q.id}_${hit.cardId}`;
-        const already = this.confirmed.get(confirmKey);
-        if (already === hit.orientation) return;
-
-        const existing = appState.session.answers.find(
-            a => a.questionId === q.id && a.studentId === hit.student.id
-        );
-        if (existing?.answer === hit.orientation) {
-            this.confirmed.set(confirmKey, hit.orientation);
+        const confirmKey = this._lockKey(q.id, hit.student.id);
+        if (this.isStudentLocked(hit.student.id, q.id)) {
+            this.confirmed.set(confirmKey, getStudentAnswer(appState.session, q.id, hit.student.id)?.answer || true);
+            this.pending.delete(hit.cardId);
             return;
         }
 
@@ -753,8 +1001,7 @@ const CardScanner = {
 
 function onCardScanned(cardId, orientation, knownStudent = null) {
     const s = appState.session;
-    if (!s?.students?.length) return;
-    if (s.status === SESSION_STATUS.QUESTION_LOCKED || s.status === SESSION_STATUS.QUESTION_RESULT) return;
+    if (!s?.students?.length || !isScanningAllowed()) return;
 
     const student = knownStudent || s.students.find(st => st.cardId === cardId);
     if (!student) {
@@ -762,13 +1009,14 @@ function onCardScanned(cardId, orientation, knownStudent = null) {
         return;
     }
 
+    const q = getCurrentQuestion(s);
+    if (CardScanner.isStudentLocked(student.id, q?.id)) return;
+
     const result = recordAnswer(s, student.id, cardId, orientation);
     if (!result.ok) return;
 
-    const eventType = result.updated ? 'ANSWER_UPDATED' : 'ANSWER_SCANNED';
-    const q = getCurrentQuestion(s);
     SyncEngine.send({
-        type: eventType,
+        type: 'ANSWER_SCANNED',
         studentId: student.id,
         cardId,
         answer: orientation,
@@ -776,13 +1024,12 @@ function onCardScanned(cardId, orientation, knownStudent = null) {
         session: getSessionSnapshot()
     });
 
+    CardScanner.confirmed.set(CardScanner._lockKey(q?.id, student.id), orientation);
+
     const tag = $('#scan-last-flash');
     if (tag) {
-        tag.textContent = result.updated
-            ? `↻ ${student.name} → ${orientation}`
-            : `✓ ${student.name} · ${orientation}`;
+        tag.textContent = `✓ ${student.name} · ${orientation}`;
         tag.classList.remove('hidden', 'update');
-        if (result.updated) tag.classList.add('update');
         appState.lastFlashStudentId = student.id;
         clearTimeout(showScanFlash._t);
         showScanFlash._t = setTimeout(() => tag.classList.add('hidden'), 900);
@@ -809,6 +1056,8 @@ function renderScanner() {
     const q = getCurrentQuestion(s);
     if (q && CardScanner.questionKey !== q.id) {
         CardScanner.resetForQuestion(q.id);
+    } else if (q) {
+        CardScanner._seedConfirmedFromAnswers();
     }
 
     const answeredList = getAnswersForQuestion(s, q?.id).filter(a => a.answer);
@@ -849,6 +1098,8 @@ function renderScanner() {
                 <span>${n}</span></div>`;
         }).join('');
     }
+
+    updateOrientationUI();
 }
 
 function renderStudentDrawer(s, q) {
@@ -880,6 +1131,13 @@ function renderStudentDrawer(s, q) {
 
 async function startCamera() {
     if (appState.cameraReady || appState.cameraStarting) return appState.cameraReady;
+
+    if (!ScanOrientation.isLandscape()) {
+        showLandscapeRequiredModal();
+        updateOrientationUI();
+        return false;
+    }
+
     appState.cameraStarting = true;
 
     const loading = $('#camera-loading');
@@ -899,6 +1157,7 @@ async function startCamera() {
 
     if (ok) {
         showView('scanner');
+        updateOrientationUI();
         renderScanner();
     } else {
         showToast('Không mở được camera — kiểm tra quyền truy cập');
@@ -1070,7 +1329,8 @@ function bindEvents() {
     });
     $('#btn-next-q-result')?.addEventListener('click', () => {
         SyncEngine.send({ type: 'NEXT_QUESTION' });
-        setTimeout(() => SyncEngine.send({ type: 'REQUEST_STATE' }), 400);
+        SyncEngine.requestState();
+        setTimeout(() => SyncEngine.requestState(), 500);
         playSound('next');
     });
     $('#btn-show-choosers')?.addEventListener('click', showChoosersModal);
@@ -1088,6 +1348,10 @@ function bindEvents() {
 
 document.addEventListener('DOMContentLoaded', () => {
     bindEvents();
+    ScanOrientation.init(() => {
+        CardScanner.pending.clear();
+    });
+    updateOrientationUI();
     const params = new URLSearchParams(location.search);
     const sessionId = params.get('session');
     if (!sessionId) {
