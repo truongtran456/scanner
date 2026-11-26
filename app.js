@@ -1,271 +1,546 @@
 'use strict';
 
+/* ============================================================
+   RUNG CHUÔNG VÀNG v3 — Scanner / Student App
+   Hỗ trợ 2 luồng:
+   1. Chế độ QUÉT THẺ (paper): kết nối PeerJS → camera scan markers
+   2. Chế độ PHÒNG MÁY (online): vào phòng → chọn tên → bấm A/B/C/D
+   ============================================================ */
+
 const SESSION_STATUS = {
-    WAITING: 'WAITING',
-    CONNECTED: 'CONNECTED',
-    QUESTION_ACTIVE: 'QUESTION_ACTIVE',
-    QUESTION_LOCKED: 'QUESTION_LOCKED',
-    QUESTION_RESULT: 'QUESTION_RESULT',
-    COMPLETED: 'COMPLETED'
+    WAITING: 'WAITING', CONNECTED: 'CONNECTED',
+    QUESTION_ACTIVE: 'QUESTION_ACTIVE', QUESTION_LOCKED: 'QUESTION_LOCKED',
+    QUESTION_RESULT: 'QUESTION_RESULT', COMPLETED: 'COMPLETED', RANKING: 'RANKING'
 };
 
 const appState = {
     sessionId: null,
+    roomCode: null,
     session: null,
-    soundEnabled: true,
+    myStudentId: null,
+    myStudentName: null,
+    myScore: 0,
+    myCorrect: 0,
+    myWrong: 0,
+    gameMode: 'paper',          // 'paper' | 'online'
     cameraReady: false,
     cameraStarting: false,
     sessionDataReady: false,
     drawerTab: 'pending',
-    lastFlashStudentId: null
+    // Paper mode
+    lastFlashStudentId: null,
+    // Online mode
+    countdownTimer: null,
+    countdownLeft: 0,
+    myAnswer: null,              // đáp án câu hiện tại
+    questionAnswered: false
 };
 
+/* ===== UTILS ===== */
+function uid(prefix = 'id') { return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,7)}`; }
 function $(sel) { return document.querySelector(sel); }
-function esc(s) {
-    return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-function showToast(msg, ms = 2500) {
-    const c = $('#toast-container');
-    const t = document.createElement('div');
-    t.className = 'toast';
-    t.textContent = msg;
-    c.appendChild(t);
-    setTimeout(() => t.remove(), ms);
-}
-
-function showModal(html) {
-    $('#modal-box').innerHTML = html;
-    $('#modal-overlay').classList.remove('hidden');
-}
-
-function hideModal() {
-    $('#modal-overlay').classList.add('hidden');
-    $('#modal-box').innerHTML = '';
-}
-
-function showView(id) {
-    $$('.view').forEach(v => v.classList.remove('active'));
-    $(`#view-${id}`)?.classList.add('active');
-}
-
 function $$(sel) { return document.querySelectorAll(sel); }
+function esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-function getShortSessionCode(sessionId) {
-    if (!sessionId) return '';
-    return sessionId.replace('SESSION-', 'S').slice(0, 8).toUpperCase();
+function showView(viewId) {
+    $$('.view').forEach(v => v.classList.remove('active'));
+    document.getElementById('view-' + viewId)?.classList.add('active');
 }
 
-function playSound(type) {
-    if (!appState.soundEnabled) return;
-    try {
-        const ctx = playSound._ctx || (playSound._ctx = new (window.AudioContext || window.webkitAudioContext)());
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        const freqs = { scan: 880, lock: 440, next: 550 };
-        osc.frequency.value = freqs[type] || 500;
-        gain.gain.setValueAtTime(0.15, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.15);
-        osc.start();
-        osc.stop(ctx.currentTime + 0.15);
-    } catch (_) {}
+function getCurrentQuestion(session) { return session?.questions?.[session.currentQuestionIndex] || null; }
+
+function getAnswersForQuestion(session, questionId) {
+    return (session?.answers || []).filter(a => a.questionId === questionId);
 }
 
-/* ===== SYNC (scanner = client) ===== */
+function getStudentAnswer(session, questionId, studentId) {
+    return session?.answers?.find(a => a.questionId === questionId && a.studentId === studentId);
+}
+
+function computeMyScore(session, studentId, gameSettings) {
+    if (!session?.questions?.length || !studentId) return { score: 0, correct: 0, wrong: 0 };
+    const cfg = gameSettings || { scoringMode: 'per_question', basePoints: 500, maxPoints: 1000, timePerQuestion: 15 };
+    const isTimeScoring = cfg.scoringMode === 'by_time';
+    let score = 0, correct = 0, wrong = 0;
+    session.questions.forEach(q => {
+        const a = session.answers?.find(x => x.questionId === q.id && x.studentId === studentId);
+        if (!a?.answer) return;
+        if (a.answer === q.correctAnswer) {
+            correct++;
+            if (isTimeScoring) {
+                const totalTime = (cfg.timePerQuestion || 15) * 1000;
+                const responseTime = a.questionStartedAt ? (a.submittedAt - a.questionStartedAt) : totalTime / 2;
+                const frac = Math.max(0, Math.min(1, 1 - responseTime / totalTime));
+                score += Math.round((cfg.basePoints || 500) + ((cfg.maxPoints || 1000) - (cfg.basePoints || 500)) * frac);
+            } else {
+                score += cfg.basePoints || 500;
+            }
+        } else { wrong++; }
+    });
+    return { score, correct, wrong };
+}
+
+/* ===== SYNC ENGINE ===== */
 const SyncEngine = {
-    peer: null,
-    conn: null,
-    onMessage: null,
-    reconnectTimer: null,
-    statePollTimer: null,
+    peer: null, conn: null, onMessage: null, reconnectTimer: null, statePollTimer: null,
 
     connectScanner(sessionId) {
         return new Promise((resolve) => {
             const hostId = 'pm-' + sessionId;
             try {
                 this.peer?.destroy();
-                this.peer = new Peer(undefined, {
-                    debug: 1,
-                    config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
-                });
+                this.peer = new Peer(undefined, { debug: 1, config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] } });
                 this.peer.on('open', () => {
                     const conn = this.peer.connect(hostId, { reliable: true });
                     let settled = false;
-                    const done = (ok) => {
-                        if (settled) return;
-                        settled = true;
-                        resolve(ok);
-                    };
+                    const done = (ok) => { if (settled) return; settled = true; resolve(ok); };
                     conn.on('data', (data) => this._handle(data));
-                    conn.on('open', () => {
-                        this.conn = conn;
-                        done(true);
-                    });
+                    conn.on('open', () => { this.conn = conn; done(true); });
                     conn.on('error', () => done(false));
                     setTimeout(() => done(false), 10000);
                 });
                 this.peer.on('error', () => resolve(false));
-            } catch {
-                resolve(false);
-            }
+            } catch { resolve(false); }
         });
     },
-
-    _handle(msg) {
-        if (this.onMessage) this.onMessage(msg);
-    },
-
-    send(msg) {
-        if (this.conn?.open) this.conn.send(msg);
-    },
-
+    _handle(msg) { if (this.onMessage) this.onMessage(msg); },
+    send(msg) { if (this.conn?.open) this.conn.send(msg); },
     destroy() {
-        clearInterval(this.reconnectTimer);
-        clearInterval(this.statePollTimer);
-        this.conn?.close();
-        this.peer?.destroy();
-        this.conn = null;
-        this.peer = null;
+        clearInterval(this.reconnectTimer); clearInterval(this.statePollTimer);
+        this.conn?.close(); this.peer?.destroy();
+        this.conn = null; this.peer = null;
     },
-
-    requestState() {
-        this.send({ type: 'REQUEST_STATE' });
-    }
+    requestState() { this.send({ type: 'REQUEST_STATE' }); }
 };
 
-/* ===== SESSION HELPERS ===== */
-function getCurrentQuestion(session) {
-    return session?.questions?.[session.currentQuestionIndex] || null;
-}
+/* ===== ENTRY POINT ===== */
+document.addEventListener('DOMContentLoaded', () => {
+    bindBaseEvents();
+    const params = new URLSearchParams(location.search);
+    const roomParam = params.get('room');
+    const sessionParam = params.get('session');
 
-function getAnswersForQuestion(session, questionId) {
-    return (session.answers || []).filter(a => a.questionId === questionId);
-}
-
-function getAnswerKey(session, questionId, studentId) {
-    return session.answers.findIndex(
-        a => a.sessionId === session.id && a.questionId === questionId && a.studentId === studentId
-    );
-}
-
-function uid(prefix = 'id') {
-    return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
-}
-
-function getStudentAnswer(session, questionId, studentId) {
-    return session?.answers?.find(
-        a => a.questionId === questionId && a.studentId === studentId
-    );
-}
-
-function recordAnswer(session, studentId, cardId, answer) {
-    const q = getCurrentQuestion(session);
-    if (!q || session.status === SESSION_STATUS.QUESTION_LOCKED ||
-        session.status === SESSION_STATUS.QUESTION_RESULT) return { ok: false };
-
-    if (!session.answers) session.answers = [];
-
-    const existingIdx = getAnswerKey(session, q.id, studentId);
-    if (existingIdx >= 0 && session.answers[existingIdx].answer === answer) {
-        return { ok: false, unchanged: true };
-    }
-
-    const hadAnswer = existingIdx >= 0 && session.answers[existingIdx].answer;
-
-    const record = {
-        id: uid('ans'),
-        sessionId: session.id,
-        questionId: q.id,
-        studentId,
-        cardId,
-        answer,
-        isCorrect: null,
-        submittedAt: Date.now()
-    };
-
-    if (existingIdx >= 0) {
-        session.answers[existingIdx] = {
-            ...session.answers[existingIdx],
-            cardId,
-            answer,
-            submittedAt: Date.now()
-        };
+    if (roomParam) {
+        // Phòng máy: vào thẳng bằng link
+        appState.gameMode = 'online';
+        appState.roomCode = roomParam.toUpperCase();
+        initOnlineMode(appState.roomCode);
+    } else if (sessionParam) {
+        // Quét thẻ giấy (paper mode — Plickers style)
+        appState.gameMode = 'paper';
+        appState.sessionId = sessionParam;
+        initPaperMode(sessionParam);
     } else {
-        session.answers.push(record);
+        // Hiện form nhập mã phòng
+        showView('enter-code');
     }
-    return { ok: true, updated: hadAnswer };
+});
+
+/* ===== BASE EVENTS ===== */
+function bindBaseEvents() {
+    // Enter code form
+    $('#btn-join-room')?.addEventListener('click', onJoinRoomClick);
+    $('#room-code-input')?.addEventListener('keydown', e => { if (e.key === 'Enter') onJoinRoomClick(); });
 }
 
-function getQuestionStats(session, questionId) {
-    const ans = getAnswersForQuestion(session, questionId);
-    const counts = { A: 0, B: 0, C: 0, D: 0 };
-    ans.forEach(a => {
-        if (a.answer && counts[a.answer] !== undefined) counts[a.answer]++;
+function onJoinRoomClick() {
+    const inp = $('#room-code-input');
+    const code = (inp?.value || '').trim().toUpperCase();
+    if (!code) { setEnterCodeStatus('Nhập mã phòng', 'error'); return; }
+    setEnterCodeStatus('Đang kết nối...', '');
+    // Thử kết nối online mode trước (mã phòng 5 ký tự)
+    appState.gameMode = 'online';
+    appState.roomCode = code;
+    initOnlineMode(code);
+}
+
+function setEnterCodeStatus(msg, type) {
+    const el = $('#enter-code-status');
+    if (!el) return;
+    el.textContent = msg;
+    el.className = 'sv-status' + (type ? ' '+type : '');
+}
+
+/* ============================================================
+   ONLINE MODE — học sinh bấm A/B/C/D
+   ============================================================ */
+function initOnlineMode(roomCode) {
+    appState.sessionId = roomCode;
+    showView('pick-name');
+    $('#pick-room-badge').textContent = 'Phòng: ' + roomCode;
+    setPickNameStatus('Đang kết nối tới phòng ' + roomCode + '...');
+
+    // Kết nối PeerJS tới host
+    SyncEngine.onMessage = handleOnlineMessage;
+    SyncEngine.connectScanner(roomCode).then(ok => {
+        if (ok) {
+            setPickNameStatus('Đã kết nối! Đang lấy danh sách học sinh...');
+            SyncEngine.send({ type: 'REQUEST_STATE' });
+            // Poll nếu chưa nhận được dữ liệu
+            SyncEngine.statePollTimer = setInterval(() => {
+                if (appState.sessionDataReady) { clearInterval(SyncEngine.statePollTimer); return; }
+                SyncEngine.send({ type: 'REQUEST_STATE' });
+            }, 2000);
+        } else {
+            setPickNameStatus('Không kết nối được — kiểm tra mã phòng và thử lại', 'error');
+            showView('enter-code');
+            setEnterCodeStatus('Không tìm thấy phòng "' + roomCode + '"', 'error');
+        }
     });
-    return { counts, answers: ans };
+
+    // Reconnect loop
+    SyncEngine.reconnectTimer = setInterval(() => {
+        if (SyncEngine.conn?.open) return;
+        SyncEngine.connectScanner(roomCode).then(ok => {
+            if (ok && appState.session) SyncEngine.send({ type: 'REQUEST_STATE' });
+        });
+    }, 8000);
 }
 
-function getSessionSnapshot() {
-    const s = appState.session;
-    if (!s) return null;
-    return JSON.parse(JSON.stringify({
-        id: s.id, classId: s.classId, questionSetId: s.questionSetId,
-        className: s.className, qsetName: s.qsetName,
-        students: s.students, questions: s.questions,
-        currentQuestionIndex: s.currentQuestionIndex,
-        status: s.status, answers: s.answers,
-        scannerConnected: s.scannerConnected, startedAt: s.startedAt
-    }));
+function setPickNameStatus(msg, type) {
+    const el = $('#pick-name-status');
+    if (!el) return;
+    el.textContent = msg;
+    el.className = 'sv-status' + (type ? ' '+type : '');
 }
 
-function mergeSession(data) {
-    if (!data) return;
-    if (!appState.session) {
-        appState.session = data;
-    } else {
-        Object.assign(appState.session, data);
+function renderStudentPicker(session) {
+    const grid = $('#student-name-list');
+    if (!grid) return;
+    const takenIds = new Set(Object.keys(session.onlineStudents || {}));
+    grid.innerHTML = session.students.map(st => {
+        const taken = takenIds.has(st.id) && st.id !== appState.myStudentId;
+        return `<button class="sv-name-btn${taken?' taken':''}" data-student-id="${st.id}" data-student-name="${esc(st.name)}" ${taken?'disabled':''}>${esc(st.name)}</button>`;
+    }).join('');
+    grid.querySelectorAll('.sv-name-btn:not([disabled])').forEach(btn => {
+        btn.addEventListener('click', () => {
+            appState.myStudentId = btn.dataset.studentId;
+            appState.myStudentName = btn.dataset.studentName;
+            onStudentPicked();
+        });
+    });
+    setPickNameStatus('');
+}
+
+function onStudentPicked() {
+    if (!appState.myStudentId) return;
+    // Thông báo cho host
+    SyncEngine.send({
+        type: 'STUDENT_JOINED',
+        studentId: appState.myStudentId,
+        name: appState.myStudentName,
+        roomCode: appState.roomCode
+    });
+    showWaitingRoom();
+}
+
+function showWaitingRoom() {
+    const session = appState.session;
+    showView('waiting');
+    $('#wait-room-badge').textContent = 'Phòng: ' + (appState.roomCode || appState.sessionId);
+    $('#wait-student-name').textContent = appState.myStudentName || '—';
+    // Nếu game đã bắt đầu (câu đang active), chuyển thẳng vào câu hỏi
+    if (session && session.status === SESSION_STATUS.QUESTION_ACTIVE) {
+        renderOnlineQuestion(session);
+    } else if (session && session.status === SESSION_STATUS.QUESTION_RESULT) {
+        renderOnlineResult(session);
+    } else if (session && session.status === SESSION_STATUS.COMPLETED) {
+        showEnded(session);
     }
-    onSessionUpdated();
 }
 
-function onSessionUpdated() {
-    const s = appState.session;
-    if (!s) return;
+function handleOnlineMessage(msg) {
+    if (!msg?.type) return;
+    const prevStatus = appState.session?.status;
 
-    if (s.status === SESSION_STATUS.COMPLETED) {
-        CardScanner.stop();
-        clearInterval(SyncEngine.statePollTimer);
-        showView('ended');
+    switch (msg.type) {
+        case 'STATE_SYNC':
+        case 'SESSION_CREATED':
+            if (msg.session) mergeOnlineSession(msg.session);
+            break;
+        case 'QUESTION_CHANGED':
+        case 'NEXT_QUESTION':
+            if (msg.session) {
+                mergeOnlineSession(msg.session);
+                // Reset trạng thái trả lời cho câu mới
+                if (msg.session.currentQuestionIndex !== appState.session?.currentQuestionIndex || prevStatus === SESSION_STATUS.QUESTION_RESULT) {
+                    appState.myAnswer = null;
+                    appState.questionAnswered = false;
+                }
+            }
+            if (appState.myStudentId && appState.session?.status === SESSION_STATUS.QUESTION_ACTIVE) {
+                renderOnlineQuestion(appState.session);
+            }
+            break;
+        case 'QUESTION_RESULT':
+        case 'QUESTION_LOCKED':
+            if (msg.session) mergeOnlineSession(msg.session);
+            if (appState.myStudentId) renderOnlineResult(appState.session);
+            break;
+        case 'SESSION_COMPLETED':
+            if (msg.session) mergeOnlineSession(msg.session);
+            showEnded(appState.session);
+            break;
+        case 'ANSWER_SCANNED':
+        case 'ANSWER_UPDATED':
+            if (msg.session) mergeOnlineSession(msg.session);
+            break;
+    }
+}
+
+function mergeOnlineSession(data) {
+    if (!data) return;
+    appState.session = JSON.parse(JSON.stringify(data));
+    appState.sessionDataReady = true;
+
+    const session = appState.session;
+    if (!session.students?.length) return;
+
+    // Nếu chưa vào tên → hiện picker
+    if (!appState.myStudentId) {
+        if (!$('#view-pick-name').classList.contains('active')) {
+            showView('pick-name');
+            $('#pick-room-badge').textContent = 'Phòng: ' + (appState.roomCode || session.id);
+        }
+        renderStudentPicker(session);
         return;
     }
 
-    if (s.questions?.length && s.students?.length) {
-        clearInterval(SyncEngine.statePollTimer);
-        appState.sessionDataReady = true;
-
-        const meta = $('#camera-prompt-meta');
-        if (meta) {
-            meta.textContent = `${s.className || 'Lớp'} · ${s.students.length} HS · ${s.questions.length} câu`;
-        }
-
-        if (!appState.cameraReady && !appState.cameraStarting) {
-            showView('camera-prompt');
-            updateOrientationUI();
-        } else {
-            showView('scanner');
-            updateOrientationUI();
-            renderScanner();
-        }
-    } else {
-        $('#wait-status').textContent = 'Đã kết nối — đang chờ dữ liệu từ máy chiếu...';
+    // Đã có tên → route theo trạng thái
+    if (session.status === SESSION_STATUS.WAITING || session.status === SESSION_STATUS.CONNECTED) {
+        showWaitingRoom();
+    } else if (session.status === SESSION_STATUS.QUESTION_ACTIVE) {
+        renderOnlineQuestion(session);
+    } else if (session.status === SESSION_STATUS.QUESTION_RESULT || session.status === SESSION_STATUS.QUESTION_LOCKED) {
+        renderOnlineResult(session);
+    } else if (session.status === SESSION_STATUS.COMPLETED) {
+        showEnded(session);
     }
 }
 
-function handleSyncMessage(msg) {
-    if (!msg?.type) return;
+/* ===== ONLINE QUESTION RENDER ===== */
+function renderOnlineQuestion(session) {
+    const q = getCurrentQuestion(session);
+    if (!q) return;
 
+    showView('question');
+    const qIdx = session.currentQuestionIndex;
+    const qTotal = session.questions.length;
+
+    $('#q-room-info').textContent = 'Phòng: ' + (appState.roomCode || session.id);
+    $('#q-num-label').textContent = `Câu ${qIdx+1}/${qTotal}`;
+    $('#sv-submitted-banner').classList.add('hidden');
+
+    // Nội dung câu hỏi
+    $('#sv-question-text').textContent = q.question || '';
+    const imgEl = $('#sv-question-image');
+    if (imgEl) imgEl.innerHTML = q.questionImage ? `<img src="${q.questionImage}" alt="">` : '';
+
+    // Đáp án
+    const answersEl = $('#sv-answers');
+    if (answersEl) {
+        answersEl.innerHTML = ['A','B','C','D'].map(letter => {
+            const ans = q.answers?.find(a => a.id === letter) || { text: letter };
+            const isSelected = appState.myAnswer === letter;
+            return `<button class="sv-ans-btn ${letter}${isSelected?' selected':''}" data-letter="${letter}">
+                <span class="sv-ans-badge">${letter}</span>
+                <span class="sv-ans-text">${esc(ans.text)}</span>
+            </button>`;
+        }).join('');
+        answersEl.querySelectorAll('.sv-ans-btn').forEach(btn => {
+            btn.addEventListener('click', () => onOnlineAnswerClick(btn.dataset.letter, session));
+        });
+    }
+
+    // Nếu đã nộp rồi thì hiện banner
+    const existing = getStudentAnswer(session, q.id, appState.myStudentId);
+    if (existing?.answer) {
+        appState.myAnswer = existing.answer;
+        appState.questionAnswered = true;
+        showSubmittedBanner(existing.answer);
+        disableAnswerButtons();
+    }
+
+    // Countdown
+    startStudentCountdown(session.gameSettings?.timePerQuestion || 15);
+
+    $('#sv-status-bar').textContent = '';
+}
+
+function onOnlineAnswerClick(letter, session) {
+    if (appState.questionAnswered) return;
+    appState.myAnswer = letter;
+    appState.questionAnswered = true;
+
+    // Highlight selected
+    $$('.sv-ans-btn').forEach(b => b.classList.toggle('selected', b.dataset.letter === letter));
+    disableAnswerButtons();
+    showSubmittedBanner(letter);
+
+    // Dừng countdown
+    stopStudentCountdown();
+
+    // Gửi đáp án về host
+    SyncEngine.send({
+        type: 'ANSWER_SCANNED',
+        studentId: appState.myStudentId,
+        answer: letter,
+        questionId: getCurrentQuestion(session)?.id,
+        submittedAt: Date.now(),
+        questionStartedAt: session._qStartedAt
+    });
+
+    $('#sv-status-bar').textContent = 'Đã gửi đáp án ✓';
+}
+
+function showSubmittedBanner(letter) {
+    const banner = $('#sv-submitted-banner');
+    if (banner) {
+        banner.classList.remove('hidden');
+        $('#sv-submitted-text').textContent = `✅ Đã chọn: ${letter}`;
+    }
+}
+
+function disableAnswerButtons() {
+    $$('.sv-ans-btn').forEach(b => { b.disabled = true; });
+}
+
+function startStudentCountdown(seconds) {
+    stopStudentCountdown();
+    let left = seconds;
+    const circumference = 2 * Math.PI * 14; // r=14 ở SVG
+    const update = () => {
+        const numEl = $('#sv-countdown'); const ringEl = $('#sv-ring-fill');
+        if (numEl) numEl.textContent = left;
+        if (ringEl) {
+            ringEl.style.strokeDashoffset = circumference * (1 - left/seconds);
+            ringEl.classList.toggle('urgent', left <= 5);
+        }
+    };
+    update();
+    appState.countdownLeft = left;
+    appState.countdownTimer = setInterval(() => {
+        left--;
+        appState.countdownLeft = left;
+        update();
+        if (left <= 0) { stopStudentCountdown(); }
+    }, 1000);
+}
+
+function stopStudentCountdown() {
+    if (appState.countdownTimer) { clearInterval(appState.countdownTimer); appState.countdownTimer = null; }
+}
+
+/* ===== ONLINE RESULT RENDER ===== */
+function renderOnlineResult(session) {
+    if (!session) return;
+    stopStudentCountdown();
+
+    const q = getCurrentQuestion(session);
+    if (!q) return;
+
+    showView('result');
+    const qIdx = session.currentQuestionIndex;
+    const qTotal = session.questions.length;
+    $('#res-room-info').textContent = 'Phòng: ' + (appState.roomCode || session.id);
+    $('#res-num-label').textContent = `Câu ${qIdx+1}/${qTotal}`;
+
+    const myAns = appState.myAnswer;
+    const isCorrect = myAns === q.correctAnswer;
+    const noAns = !myAns;
+
+    // Banner
+    const banner = $('#sv-result-banner');
+    if (banner) {
+        if (noAns) { banner.textContent = '⏰ Hết giờ!'; banner.className = 'sv-result-banner timeout'; }
+        else if (isCorrect) { banner.textContent = '✅ CHÍNH XÁC!'; banner.className = 'sv-result-banner correct'; }
+        else { banner.textContent = `❌ Sai rồi! Đúng là ${q.correctAnswer}`; banner.className = 'sv-result-banner wrong'; }
+    }
+
+    // Hiện 4 đáp án với kết quả
+    const resAns = $('#sv-result-answers');
+    if (resAns) {
+        resAns.innerHTML = ['A','B','C','D'].map(letter => {
+            const ans = q.answers?.find(a => a.id === letter) || { text: letter };
+            const isCorrectAns = letter === q.correctAnswer;
+            const isMyWrong = letter === myAns && !isCorrectAns;
+            let cls = 'other';
+            if (isCorrectAns) cls = 'correct-ans';
+            else if (isMyWrong) cls = 'my-ans-wrong';
+            return `<div class="sv-res-ans-item ${cls}">
+                <span class="sv-res-badge ${letter}">${letter}</span>
+                <span>${esc(ans.text)}</span>
+                ${isCorrectAns ? '<span style="margin-left:auto">✅</span>' : ''}
+                ${isMyWrong ? '<span style="margin-left:auto">👈</span>' : ''}
+            </div>`;
+        }).join('');
+    }
+
+    // Cập nhật điểm
+    const { score, correct, wrong } = computeMyScore(session, appState.myStudentId, session.gameSettings);
+    appState.myScore = score;
+    appState.myCorrect = correct;
+    appState.myWrong = wrong;
+    const scoreEl = $('#sv-score-val');
+    if (scoreEl) scoreEl.textContent = session.gameSettings?.scoringMode === 'by_time' ? score : correct + '/' + qTotal;
+}
+
+/* ===== END ===== */
+function showEnded(session) {
+    stopStudentCountdown();
+    showView('ended');
+    $('#end-student-name').textContent = appState.myStudentName || '—';
+
+    const { score, correct, wrong } = computeMyScore(session, appState.myStudentId, session?.gameSettings);
+    const isTimeScoring = session?.gameSettings?.scoringMode === 'by_time';
+    const qTotal = session?.questions?.length || 0;
+    $('#end-score-val').textContent = isTimeScoring ? score : correct + '/' + qTotal;
+    const correctEl = $('#end-correct-info');
+    if (correctEl) {
+        correctEl.textContent = `Đúng: ${correct} · Sai: ${wrong} · Không trả lời: ${qTotal - correct - wrong}`;
+    }
+}
+
+/* ============================================================
+   PAPER MODE — Plickers camera scanner
+   (giữ nguyên từ bản cũ, chỉ đổi prefix PeerJS thành rcv-)
+   ============================================================ */
+async function initPaperMode(sessionId) {
+    appState.sessionId = sessionId;
+    appState.session = { id: sessionId, status: SESSION_STATUS.WAITING, students: [], questions: [], answers: [] };
+
+    showView('waiting');
+    $('#wait-room-badge').textContent = sessionId;
+    $('#wait-student-name').textContent = 'Đang kết nối...';
+
+    SyncEngine.onMessage = handlePaperMessage;
+    const connected = await SyncEngine.connectScanner(sessionId);
+
+    if (connected) {
+        SyncEngine.send({ type: 'SCANNER_CONNECTED' });
+        SyncEngine.send({ type: 'REQUEST_STATE' });
+        SyncEngine.statePollTimer = setInterval(() => {
+            if (appState.sessionDataReady) { clearInterval(SyncEngine.statePollTimer); return; }
+            SyncEngine.send({ type: 'REQUEST_STATE' });
+        }, 2000);
+    } else {
+        $('#wait-student-name').textContent = 'Chưa kết nối — mở phiên trên máy tính trước';
+    }
+
+    // Reconnect loop
+    SyncEngine.reconnectTimer = setInterval(() => {
+        if (SyncEngine.conn?.open) return;
+        SyncEngine.connectScanner(sessionId).then(ok => {
+            if (ok) {
+                SyncEngine.send({ type: 'SCANNER_CONNECTED' });
+                SyncEngine.send({ type: 'REQUEST_STATE' });
+            }
+        });
+    }, 5000);
+}
+
+function handlePaperMessage(msg) {
+    if (!msg?.type) return;
     const prevQIdx = appState.session?.currentQuestionIndex;
     const prevStatus = appState.session?.status;
 
@@ -278,1197 +553,335 @@ function handleSyncMessage(msg) {
         case 'QUESTION_LOCKED':
         case 'ANSWER_SCANNED':
         case 'ANSWER_UPDATED':
-            if (msg.session) mergeSession(msg.session);
-            else renderScanner();
+            if (msg.session) mergePaperSession(msg.session);
+            else renderPaperScanner();
             break;
         case 'SESSION_COMPLETED':
-            if (msg.session) mergeSession(msg.session);
-            else if (appState.session) {
-                appState.session.status = SESSION_STATUS.COMPLETED;
-                onSessionUpdated();
-            }
+            if (msg.session) mergePaperSession(msg.session);
+            else if (appState.session) { appState.session.status = SESSION_STATUS.COMPLETED; onPaperSessionUpdated(); }
             break;
     }
 
     const s = appState.session;
     const q = getCurrentQuestion(s);
     const qChanged = s && (s.currentQuestionIndex !== prevQIdx || s.status !== prevStatus);
-    if (qChanged && q && (
-        msg.type === 'NEXT_QUESTION' ||
-        msg.type === 'QUESTION_CHANGED' ||
-        msg.type === 'STATE_SYNC' ||
-        msg.type === 'QUESTION_RESULT'
-    )) {
-        CardScanner.onQuestionChanged(q.id);
-    } else if (qChanged) {
-        updateOrientationUI();
-    }
+    if (qChanged && q) CardScanner.onQuestionChanged(q.id);
 }
 
-/* ===== MARKER (Plickers-style) — nhận diện thẻ số + hướng A/B/C/D ===== */
-const MarkerUtil = {
-    // rot = số lần xoay thuận chiều kim đồng hồ để đưa ảnh về chuẩn
-    ORIENT: ['A', 'B', 'C', 'D'],
-
-    DATA_CELLS: (() => {
-        const cells = [];
-        for (let r = 1; r <= 5; r++) {
-            for (let c = 1; c <= 5; c++) {
-                if ((r === 1 || r === 5) && (c === 1 || c === 5)) continue;
-                cells.push([r, c]);
-            }
-        }
-        return cells;
-    })(),
-
-    MIN_CODE_DISTANCE: 7,
-    _book: null,
-    _bookSize: 0,
-
-    // Sinh bộ mã sao cho 2 thẻ bất kỳ khác nhau ít nhất 7 ô → chống đọc nhầm
-    buildBook(count) {
-        const bits = this.DATA_CELLS.length;
-        const book = [];
-        let seed = 0x1f2e3d4c >>> 0;
-        const next = () => {
-            seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
-            return seed;
-        };
-        let guard = 0;
-        while (book.length < count && guard < 500000) {
-            guard++;
-            const code = new Uint8Array(bits);
-            let ones = 0;
-            for (let i = 0; i < bits; i++) {
-                const b = (next() >>> 18) & 1;
-                code[i] = b;
-                ones += b;
-            }
-            if (ones < 6 || ones > bits - 6) continue;
-            let ok = true;
-            for (const prev of book) {
-                let d = 0;
-                for (let i = 0; i < bits; i++) if (prev[i] !== code[i]) d++;
-                if (d < this.MIN_CODE_DISTANCE) { ok = false; break; }
-            }
-            if (ok) book.push(code);
-        }
-        return book;
-    },
-
-    getCode(cardNumber) {
-        const need = Math.max(60, cardNumber + 10);
-        if (!this._book || this._bookSize < need) {
-            this._book = this.buildBook(need);
-            this._bookSize = need;
-        }
-        const idx = (Math.max(1, cardNumber) - 1) % this._book.length;
-        return this._book[idx];
-    },
-
-    getGrid(cardNumber) {
-        const grid = Array.from({ length: 7 }, () => Array(7).fill(0));
-        for (let i = 0; i < 7; i++) {
-            grid[0][i] = grid[6][i] = grid[i][0] = grid[i][6] = 1;
-        }
-        grid[1][1] = 1;
-        grid[1][5] = 0;
-        grid[5][1] = 0;
-        grid[5][5] = 0;
-        const code = this.getCode(cardNumber);
-        this.DATA_CELLS.forEach(([r, c], i) => { grid[r][c] = code[i]; });
-        return grid;
-    },
-
-    /** Mã thẻ in từ phiên bản presenter cũ — vẫn thử khớp để tương thích */
-    getLegacyGrid(cardNumber) {
-        const grid = Array.from({ length: 7 }, () => Array(7).fill(0));
-        for (let i = 0; i < 7; i++) {
-            grid[0][i] = grid[6][i] = grid[i][0] = grid[i][6] = 1;
-        }
-        let seed = cardNumber * 7919 + 104729;
-        for (let r = 1; r < 6; r++) {
-            for (let c = 1; c < 6; c++) {
-                seed = (seed * 1103515245 + 12345) & 0x7fffffff;
-                grid[r][c] = (seed % 3) !== 0 ? 1 : 0;
-            }
-        }
-        grid[1][1] = grid[1][5] = grid[5][1] = 1;
-        grid[5][5] = 0;
-        return grid;
-    },
-
-    _buildPatterns(students) {
-        const patterns = [];
-        for (const st of students) {
-            patterns.push({ student: st, grid: this.getGrid(st.cardNumber), legacy: false });
-            patterns.push({ student: st, grid: this.getLegacyGrid(st.cardNumber), legacy: true });
-        }
-        return patterns;
-    },
-
-    rotateGrid(grid, times) {
-        let g = grid.map(row => [...row]);
-        for (let t = 0; t < times; t++) {
-            const n = g.length;
-            const rotated = Array.from({ length: n }, () => Array(n).fill(0));
-            for (let r = 0; r < n; r++) {
-                for (let c = 0; c < n; c++) {
-                    rotated[c][n - 1 - r] = g[r][c];
-                }
-            }
-            g = rotated;
-        }
-        return g;
-    },
-
-    toGray(src, sw, sh, maxW) {
-        const scale = Math.min(1, maxW / sw);
-        const w = Math.max(1, Math.round(sw * scale));
-        const h = Math.max(1, Math.round(sh * scale));
-        const gray = new Uint8Array(w * h);
-        for (let y = 0; y < h; y++) {
-            const sy = Math.min(sh - 1, Math.round(y / scale));
-            for (let x = 0; x < w; x++) {
-                const sx = Math.min(sw - 1, Math.round(x / scale));
-                const i = (sy * sw + sx) * 4;
-                gray[y * w + x] = (src[i] * 77 + src[i + 1] * 150 + src[i + 2] * 29) >> 8;
-            }
-        }
-        return { gray, w, h };
-    },
-
-    adaptiveThreshold(gray, w, h) {
-        const iw = w + 1;
-        const integral = new Uint32Array(iw * (h + 1));
-        for (let y = 0; y < h; y++) {
-            let rowSum = 0;
-            for (let x = 0; x < w; x++) {
-                rowSum += gray[y * w + x];
-                integral[(y + 1) * iw + (x + 1)] = integral[y * iw + (x + 1)] + rowSum;
-            }
-        }
-        const bin = new Uint8Array(w * h);
-        const half = Math.max(4, Math.round(Math.min(w, h) / 14));
-        for (let y = 0; y < h; y++) {
-            const y0 = Math.max(0, y - half);
-            const y1 = Math.min(h - 1, y + half);
-            for (let x = 0; x < w; x++) {
-                const x0 = Math.max(0, x - half);
-                const x1 = Math.min(w - 1, x + half);
-                const area = (y1 - y0 + 1) * (x1 - x0 + 1);
-                const sum = integral[(y1 + 1) * iw + (x1 + 1)]
-                    - integral[y0 * iw + (x1 + 1)]
-                    - integral[(y1 + 1) * iw + x0]
-                    + integral[y0 * iw + x0];
-                bin[y * w + x] = gray[y * w + x] * area < sum * 0.86 ? 1 : 0;
-            }
-        }
-        return bin;
-    },
-
-    findQuads(bin, w, h) {
-        const total = w * h;
-        const seen = new Uint8Array(total);
-        const stack = new Int32Array(total);
-        const quads = [];
-        const minArea = Math.max(120, Math.round(total / 6000));
-        const maxArea = Math.round(total * 0.5);
-
-        for (let start = 0; start < total; start++) {
-            if (!bin[start] || seen[start]) continue;
-
-            let sp = 0;
-            stack[sp++] = start;
-            seen[start] = 1;
-
-            let area = 0;
-            let minX = w, maxX = -1, minY = h, maxY = -1;
-            let minSum = Infinity, maxSum = -Infinity, minDiff = Infinity, maxDiff = -Infinity;
-            let pTL = 0, pBR = 0, pBL = 0, pTR = 0;
-
-            while (sp > 0) {
-                const p = stack[--sp];
-                const x = p % w;
-                const y = (p / w) | 0;
-                area++;
-                if (x < minX) minX = x;
-                if (x > maxX) maxX = x;
-                if (y < minY) minY = y;
-                if (y > maxY) maxY = y;
-                const s = x + y;
-                const d = x - y;
-                if (s < minSum) { minSum = s; pTL = p; }
-                if (s > maxSum) { maxSum = s; pBR = p; }
-                if (d < minDiff) { minDiff = d; pBL = p; }
-                if (d > maxDiff) { maxDiff = d; pTR = p; }
-
-                for (let dy = -1; dy <= 1; dy++) {
-                    const ny = y + dy;
-                    if (ny < 0 || ny >= h) continue;
-                    for (let dx = -1; dx <= 1; dx++) {
-                        const nx = x + dx;
-                        if (nx < 0 || nx >= w) continue;
-                        const np = ny * w + nx;
-                        if (bin[np] && !seen[np]) {
-                            seen[np] = 1;
-                            stack[sp++] = np;
-                        }
-                    }
-                }
-            }
-
-            if (area < minArea || area > maxArea) continue;
-
-            const bw = maxX - minX + 1;
-            const bh = maxY - minY + 1;
-            if (bw < 16 || bh < 16) continue;
-            const boxRatio = bw / bh;
-            if (boxRatio < 0.5 || boxRatio > 2.0) continue;
-
-            const pt = p => ({ x: p % w, y: (p / w) | 0 });
-            const quad = [pt(pTL), pt(pTR), pt(pBR), pt(pBL)];
-            if (!this.isSquarish(quad, area)) continue;
-
-            quads.push(quad);
-            if (quads.length >= 64) break;
-        }
-        return quads;
-    },
-
-    isSquarish(quad, area) {
-        const len = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-        const sides = [
-            len(quad[0], quad[1]), len(quad[1], quad[2]),
-            len(quad[2], quad[3]), len(quad[3], quad[0])
-        ];
-        const min = Math.min(...sides);
-        const max = Math.max(...sides);
-        if (min < 14 || min / max < 0.55) return false;
-
-        const quadArea = 0.5 * Math.abs(
-            (quad[0].x * quad[1].y - quad[1].x * quad[0].y) +
-            (quad[1].x * quad[2].y - quad[2].x * quad[1].y) +
-            (quad[2].x * quad[3].y - quad[3].x * quad[2].y) +
-            (quad[3].x * quad[0].y - quad[0].x * quad[3].y)
-        );
-        if (quadArea <= 0) return false;
-        const fill = area / quadArea;
-        return fill > 0.28 && fill < 1.05;
-    },
-
-    samplePerspective(gray, w, h, quad) {
-        const n = 7;
-        const at = (u, v) => {
-            const x = (1 - u) * (1 - v) * quad[0].x + u * (1 - v) * quad[1].x
-                + u * v * quad[2].x + (1 - u) * v * quad[3].x;
-            const y = (1 - u) * (1 - v) * quad[0].y + u * (1 - v) * quad[1].y
-                + u * v * quad[2].y + (1 - u) * v * quad[3].y;
-            const xi = Math.round(x);
-            const yi = Math.round(y);
-            if (xi < 0 || yi < 0 || xi >= w || yi >= h) return -1;
-            return gray[yi * w + xi];
-        };
-
-        const offsets = [[0.5, 0.5], [0.33, 0.33], [0.67, 0.33], [0.33, 0.67], [0.67, 0.67]];
-        const vals = Array.from({ length: n }, () => Array(n).fill(255));
-        for (let r = 0; r < n; r++) {
-            for (let c = 0; c < n; c++) {
-                let sum = 0, count = 0;
-                for (const [ou, ov] of offsets) {
-                    const v = at((c + ou) / n, (r + ov) / n);
-                    if (v >= 0) { sum += v; count++; }
-                }
-                vals[r][c] = count ? sum / count : 255;
-            }
-        }
-        return vals;
-    },
-
-    binarizeCells(vals) {
-        const flat = [];
-        for (const row of vals) for (const v of row) flat.push(v);
-        const min = Math.min(...flat);
-        const max = Math.max(...flat);
-        if (max - min < 35) return null;
-
-        let threshold = (min + max) / 2;
-        let bestVar = -1;
-        for (let t = min + 2; t < max; t += 3) {
-            let sumLo = 0, nLo = 0, sumHi = 0, nHi = 0;
-            for (const v of flat) {
-                if (v < t) { sumLo += v; nLo++; } else { sumHi += v; nHi++; }
-            }
-            if (!nLo || !nHi) continue;
-            const diff = sumLo / nLo - sumHi / nHi;
-            const varB = nLo * nHi * diff * diff;
-            if (varB > bestVar) { bestVar = varB; threshold = t; }
-        }
-        return vals.map(row => row.map(v => (v < threshold ? 1 : 0)));
-    },
-
-    hasBorderRing(grid) {
-        let dark = 0;
-        for (let i = 0; i < 7; i++) {
-            dark += grid[0][i] + grid[6][i];
-            if (i > 0 && i < 6) dark += grid[i][0] + grid[i][6];
-        }
-        return dark >= 21;
-    },
-
-    matchGrid(sampled, patterns) {
-        for (let rot = 0; rot < 4; rot++) {
-            const g = this.rotateGrid(sampled, rot);
-            const modernAnchor = g[1][1] === 1 && g[1][5] === 0 && g[5][1] === 0 && g[5][5] === 0;
-            const legacyAnchor = g[1][1] === 1 && g[1][5] === 1 && g[5][1] === 1 && g[5][5] === 0;
-            if (!modernAnchor && !legacyAnchor) continue;
-
-            let best = null, secondDist = Infinity;
-            for (const p of patterns) {
-                if (p.legacy && !legacyAnchor) continue;
-                if (!p.legacy && !modernAnchor) continue;
-                let d = 0;
-                for (const [r, c] of this.DATA_CELLS) {
-                    if (g[r][c] !== p.grid[r][c]) d++;
-                }
-                if (!best || d < best.d) {
-                    secondDist = best ? best.d : secondDist;
-                    best = { d, student: p.student };
-                } else if (d < secondDist) {
-                    secondDist = d;
-                }
-            }
-
-            if (!best || best.d > 4) continue;
-            if (secondDist - best.d < 1) continue;
-
-            return {
-                student: best.student,
-                cardId: best.student.cardId,
-                cardNumber: best.student.cardNumber,
-                orientation: this.ORIENT[rot],
-                dist: best.d
-            };
-        }
-        return null;
-    },
-
-    stats: { quads: 0, decoded: 0 },
-
-    correctOrientation(letter, offset) {
-        const i = this.ORIENT.indexOf(letter);
-        if (i < 0 || !offset) return letter;
-        return this.ORIENT[(i + offset) % 4];
-    },
-
-    decodeAll(imageData, width, height, students) {
-        this.stats.quads = 0;
-        this.stats.decoded = 0;
-        if (!students?.length) return [];
-
-        const { gray, w, h } = this.toGray(imageData, width, height, 640);
-        const bin = this.adaptiveThreshold(gray, w, h);
-        const quads = this.findQuads(bin, w, h);
-        this.stats.quads = quads.length;
-        if (!quads.length) return [];
-
-        const patterns = this._buildPatterns(students);
-
-        const byCard = new Map();
-        for (const quad of quads) {
-            const vals = this.samplePerspective(gray, w, h, quad);
-            const sampled = this.binarizeCells(vals);
-            if (!sampled || !this.hasBorderRing(sampled)) continue;
-
-            const hit = this.matchGrid(sampled, patterns);
-            if (!hit) continue;
-
-            const prev = byCard.get(hit.cardId);
-            if (!prev || hit.dist < prev.dist) byCard.set(hit.cardId, hit);
-        }
-
-        this.stats.decoded = byCard.size;
-        return Array.from(byCard.values());
-    },
-
-    rotateRgba90CW(data, w, h, times) {
-        let src = data, cw = w, ch = h;
-        for (let t = 0; t < times; t++) {
-            const out = new Uint8ClampedArray(cw * ch * 4);
-            const nw = ch, nh = cw;
-            for (let y = 0; y < ch; y++) {
-                for (let x = 0; x < cw; x++) {
-                    const si = (y * cw + x) * 4;
-                    const nx = ch - 1 - y, ny = x;
-                    const di = (ny * nw + nx) * 4;
-                    out[di] = src[si];
-                    out[di + 1] = src[si + 1];
-                    out[di + 2] = src[si + 2];
-                    out[di + 3] = src[si + 3];
-                }
-            }
-            src = out; cw = nw; ch = nh;
-        }
-        return { data: src, width: cw, height: ch };
-    },
-
-    /** UI dọc (khóa xoay + cầm ngang): thử vài góc, chọn dist thấp nhất / thẻ */
-    decodeWithRotations(imageData, width, height, students, rotations) {
-        const perCard = new Map();
-        let maxQuads = 0;
-        for (const times of rotations) {
-            let data = imageData, w = width, h = height;
-            if (times > 0) {
-                const r = this.rotateRgba90CW(imageData, width, height, times);
-                data = r.data; w = r.width; h = r.height;
-            }
-            const hits = this.decodeAll(data, w, h, students);
-            maxQuads = Math.max(maxQuads, this.stats.quads);
-            for (const hit of hits) {
-                const prev = perCard.get(hit.cardId);
-                if (!prev || hit.dist < prev.dist) perCard.set(hit.cardId, hit);
-            }
-        }
-        this.stats.quads = maxQuads;
-        this.stats.decoded = perCard.size;
-        return Array.from(perCard.values());
-    }
-};
-
-/* ===== HƯỚNG MÀN HÌNH (screen.orientation + viewport) ===== */
-const ScanOrientation = {
-    _landscape: false,
-    _landscapeMq: null,
-
-    init(onChange) {
-        this._onChange = onChange;
-        this._landscapeMq = window.matchMedia('(orientation: landscape)');
-        this._read();
-        const fire = () => setTimeout(() => this._handleChange(), 100);
-        window.addEventListener('orientationchange', fire);
-        window.addEventListener('resize', fire);
-        window.visualViewport?.addEventListener('resize', fire);
-        this._landscapeMq.addEventListener?.('change', fire);
-        this._landscapeMq.addListener?.(fire);
-        screen.orientation?.addEventListener('change', fire);
-        this._handleChange();
-    },
-
-    _read() {
-        const iw = window.innerWidth;
-        const ih = window.innerHeight;
-        const t = screen.orientation?.type;
-
-        if (t?.startsWith('landscape')) {
-            this._landscape = true;
-        } else if (t?.startsWith('portrait')) {
-            this._landscape = false;
-        } else {
-            this._landscape = iw > ih;
-        }
-
-        if (iw > ih) this._landscape = true;
-        else if (ih > iw) this._landscape = false;
-    },
-
-    _handleChange() {
-        const was = this._landscape;
-        this._read();
-        updateOrientationUI();
-        if (was !== this._landscape) this._onChange?.(was);
-    },
-
-    isLandscape() {
-        return this._landscape;
-    }
-};
-
-function getScanOrientGuide() {
-    if (ScanOrientation.isLandscape()) {
-        return {
-            tip: 'Giơ thẻ dọc — đáp án ở trên cùng',
-            banner: '✓ Xoay ngang OK · Giơ thẻ dọc, đáp án ở trên',
-            pill: 'QUÉT ✓',
-            warn: false
-        };
-    }
-    return {
-        tip: 'Cầm dọc máy · Giơ thẻ dọc — đáp án ở trên cùng',
-        banner: '📱 Cầm dọc máy để quét · Hoặc mở khóa xoay rồi xoay ngang',
-        pill: 'DỌC ✓',
-        warn: false
-    };
+function mergePaperSession(data) {
+    if (!data) return;
+    appState.session = data;
+    onPaperSessionUpdated();
 }
 
-function isScanningAllowed() {
+function onPaperSessionUpdated() {
     const s = appState.session;
-    if (!s || !appState.cameraReady) return false;
-    if (s.status === SESSION_STATUS.QUESTION_LOCKED ||
-        s.status === SESSION_STATUS.QUESTION_RESULT) return false;
-    return true;
-}
-
-function updateOrientationUI() {
-    const landscape = ScanOrientation.isLandscape();
-    const portrait = !landscape;
-    const scanning = isScanningAllowed();
-    const guide = getScanOrientGuide();
-
-    document.body.classList.toggle('portrait-mode', portrait);
-    document.body.classList.toggle('landscape-mode', landscape);
-
-    const view = $('#view-scanner');
-    view?.classList.toggle('scan-landscape', landscape);
-    view?.classList.toggle('scan-portrait-mode', portrait && appState.cameraReady);
-
-    const showBanner = portrait && appState.cameraReady;
-    const banner = $('#scan-portrait-banner');
-    banner?.classList.toggle('hidden', !showBanner);
-    banner?.classList.remove('warn');
-    if (banner && showBanner) banner.textContent = guide.banner;
-
-    $('#orientation-prompt')?.classList.add('hidden');
-
-    const orientPill = $('#scan-orient-pill');
-    if (orientPill) {
-        if (!appState.cameraReady) {
-            orientPill.textContent = '—';
-            orientPill.classList.remove('landscape', 'portrait', 'warn');
-        } else if (scanning) {
-            orientPill.textContent = guide.pill;
-            orientPill.classList.toggle('warn', guide.warn);
-            orientPill.classList.toggle('landscape', landscape && !guide.warn);
-            orientPill.classList.toggle('portrait', portrait && !guide.warn);
+    if (!s) return;
+    if (s.status === SESSION_STATUS.COMPLETED) { CardScanner.stop(); showView('ended'); return; }
+    if (s.questions?.length && s.students?.length) {
+        appState.sessionDataReady = true;
+        clearInterval(SyncEngine.statePollTimer);
+        if (!appState.cameraReady && !appState.cameraStarting) {
+            showView('waiting');
+            $('#wait-student-name').textContent = 'Sẵn sàng quét';
         } else {
-            orientPill.textContent = guide.pill.replace(' ✓', '');
-            orientPill.classList.toggle('warn', guide.warn);
-            orientPill.classList.toggle('landscape', landscape && !guide.warn);
-            orientPill.classList.toggle('portrait', portrait && !guide.warn);
+            renderPaperScanner();
         }
     }
+}
 
-    const tip = $('#scan-frame-tip');
-    if (tip) {
-        if (!appState.cameraReady) tip.textContent = 'Bật camera để quét';
-        else if (!scanning) tip.textContent = 'Chờ câu hỏi mới...';
-        else tip.textContent = guide.tip;
-    }
+function renderPaperScanner() {
+    // Paper scanner dùng view question nhưng hiển thị camera
+    // (tính năng camera sẽ hoạt động khi bấm "bắt đầu" từ lobby)
+    const s = appState.session;
+    if (!s?.questions?.length) return;
+    const q = getCurrentQuestion(s);
+    if (q) {
+        showView('question');
+        $('#sv-question-text').textContent = q.question || '';
+        const answered = getAnswersForQuestion(s, q.id).filter(a => a.answer).length;
+        const total = s.students.length;
+        $('#sv-status-bar').textContent = `Đã quét: ${answered}/${total} học sinh`;
+        $('#q-num-label').textContent = `Câu ${s.currentQuestionIndex+1}/${s.questions.length}`;
 
-    const camBlock = $('#camera-portrait-block');
-    const camBtn = $('#btn-start-camera');
-    const onCameraPrompt = $('#view-camera-prompt')?.classList.contains('active');
-    camBlock?.classList.toggle('hidden', !onCameraPrompt);
-    if (camBtn) {
-        camBtn.disabled = false;
-        camBtn.textContent = '▶ Bật camera & quét';
-    }
-
-    $('#view-camera-prompt')?.classList.toggle('prompt-landscape', landscape);
-    $('#view-camera-prompt')?.classList.toggle('prompt-portrait', portrait && onCameraPrompt);
-    $('#view-waiting')?.classList.toggle('prompt-landscape', landscape);
-
-    const waitTip = $('.wait-orient-tip');
-    if (waitTip) {
-        waitTip.innerHTML = '📱 <strong>Cầm dọc máy</strong> để quét · Hoặc mở khóa xoay rồi xoay ngang';
+        const answersEl = $('#sv-answers');
+        if (answersEl) {
+            answersEl.innerHTML = ['A','B','C','D'].map(letter => {
+                const ans = q.answers?.find(a => a.id === letter) || { text: letter };
+                const cnt = getAnswersForQuestion(s, q.id).filter(a => a.answer === letter).length;
+                return `<div class="sv-ans-btn ${letter}" style="cursor:default">
+                    <span class="sv-ans-badge">${letter}</span>
+                    <span class="sv-ans-text">${esc(ans.text)}</span>
+                    ${s.status === SESSION_STATUS.QUESTION_RESULT ? `<span style="margin-left:auto;font-weight:800">${cnt}</span>` : ''}
+                </div>`;
+            }).join('');
+        }
     }
 }
 
-function captureScanFrame(video, canvas, ctx) {
-    const vw = video.videoWidth;
-    const vh = video.videoHeight;
-    if (!vw || !vh) return null;
-
-    const drawCtx = ctx || canvas.getContext('2d', { willReadFrequently: true });
-    canvas.width = vw;
-    canvas.height = vh;
-    drawCtx.drawImage(video, 0, 0);
-
-    return {
-        data: drawCtx.getImageData(0, 0, vw, vh).data,
-        width: vw,
-        height: vh,
-        videoLandscape: vw > vh
-    };
-}
-
-function waitForVideoReady(video, timeoutMs = 10000) {
-    if (video.videoWidth > 0 && video.videoHeight > 0) return Promise.resolve(true);
-    return new Promise(resolve => {
-        const deadline = Date.now() + timeoutMs;
-        let done = false;
-        const finish = (ok) => {
-            if (done) return;
-            done = true;
-            video.removeEventListener('loadedmetadata', onReady);
-            video.removeEventListener('loadeddata', onReady);
-            video.removeEventListener('resize', onReady);
-            resolve(ok);
-        };
-        const onReady = () => {
-            if (video.videoWidth > 0 && video.videoHeight > 0) finish(true);
-        };
-        video.addEventListener('loadedmetadata', onReady);
-        video.addEventListener('loadeddata', onReady);
-        video.addEventListener('resize', onReady);
-        const poll = () => {
-            if (video.videoWidth > 0 && video.videoHeight > 0) return finish(true);
-            if (Date.now() > deadline) return finish(false);
-            requestAnimationFrame(poll);
-        };
-        poll();
-    });
-}
-
-/* ===== CARD SCANNER ===== */
+/* ===== CARD SCANNER (Camera / Plickers CV — paper mode) ===== */
 const CardScanner = {
-    stream: null,
-    rafId: null,
-    frameCount: 0,
-    pending: new Map(),
-    confirmed: new Map(),
-    questionKey: null,
-    _drawCtx: null,
-    _lastQuads: 0,
-    _lastDecoded: 0,
+    stream: null, rafId: null, frameCount: 0, pending: new Map(), confirmed: new Map(), questionKey: null,
     CONFIRM_FRAMES: 1,
-
-    _lockKey(questionId, studentId) {
-        return `${questionId}_${studentId}`;
-    },
-
-    resetForQuestion(questionId) {
-        this.pending.clear();
-        this.confirmed.clear();
-        this.questionKey = questionId;
-        this.frameCount = 0;
-        this._seedConfirmedFromAnswers();
-    },
-
-    _seedConfirmedFromAnswers() {
-        const s = appState.session;
-        const q = getCurrentQuestion(s);
-        if (!s || !q) return;
-        for (const st of s.students || []) {
-            const ans = getStudentAnswer(s, q.id, st.id);
-            if (ans?.answer) {
-                this.confirmed.set(this._lockKey(q.id, st.id), ans.answer);
-            }
+    _lockKey(qId, stId) { return `${qId}_${stId}`; },
+    resetForQuestion(qId) { this.pending.clear(); this.confirmed.clear(); this.questionKey = qId; this.frameCount = 0; this._seedFromAnswers(); },
+    _seedFromAnswers() {
+        const s = appState.session; const q = getCurrentQuestion(s); if (!s||!q) return;
+        for (const st of s.students||[]) {
+            const a = getStudentAnswer(s, q.id, st.id);
+            if (a?.answer) this.confirmed.set(this._lockKey(q.id, st.id), a.answer);
         }
     },
-
-    getConfirmedAnswer(studentId, questionId) {
-        if (!studentId || !questionId) return null;
-        return this.confirmed.get(this._lockKey(questionId, studentId)) || null;
-    },
-
-    onQuestionChanged(questionId) {
-        if (questionId) this.resetForQuestion(questionId);
-        const video = $('#scanner-video');
-        if (video?.srcObject) video.play().catch(() => {});
-        updateOrientationUI();
-    },
-
+    getConfirmedAnswer(stId, qId) { return this.confirmed.get(this._lockKey(qId, stId)) || null; },
+    onQuestionChanged(qId) { if (qId) this.resetForQuestion(qId); },
     async start(videoEl, canvasEl) {
-        if (this.stream) {
-            this._ensureLoop(videoEl, canvasEl);
-            return true;
-        }
+        if (this.stream) { this._ensureLoop(videoEl, canvasEl); return true; }
         try {
-            this.stream = await navigator.mediaDevices.getUserMedia({
-                video: {
-                    facingMode: { ideal: 'environment' },
-                    width: { ideal: 1280 },
-                    height: { ideal: 720 }
-                },
-                audio: false
-            });
-            videoEl.srcObject = this.stream;
-            videoEl.setAttribute('playsinline', 'true');
-            videoEl.muted = true;
+            this.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+            videoEl.srcObject = this.stream; videoEl.setAttribute('playsinline','true'); videoEl.muted = true;
             await videoEl.play();
-            await waitForVideoReady(videoEl);
-            appState.cameraReady = true;
-            this._ensureLoop(videoEl, canvasEl);
-            return true;
-        } catch (e) {
-            console.warn('Camera error:', e);
-            return false;
-        }
+            appState.cameraReady = true; this._ensureLoop(videoEl, canvasEl); return true;
+        } catch (e) { return false; }
     },
-
-    stop() {
-        cancelAnimationFrame(this.rafId);
-        this.rafId = null;
-        this.stream?.getTracks().forEach(t => t.stop());
-        this.stream = null;
-        this.pending.clear();
-        this.confirmed.clear();
-        this.frameCount = 0;
-        appState.cameraReady = false;
-    },
-
-    _ensureLoop(video, canvas) {
-        if (this.rafId) return;
-        this._loop(video, canvas);
-    },
-
+    stop() { cancelAnimationFrame(this.rafId); this.rafId=null; this.stream?.getTracks().forEach(t=>t.stop()); this.stream=null; this.pending.clear(); this.confirmed.clear(); appState.cameraReady=false; },
+    _ensureLoop(video, canvas) { if (this.rafId) return; this._loop(video, canvas); },
     _loop(video, canvas) {
-        if (!this._drawCtx) {
-            this._drawCtx = canvas.getContext('2d', { willReadFrequently: true });
-        }
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
         const tick = () => {
             this.rafId = requestAnimationFrame(tick);
-            if (!this.stream) return;
-
             const status = appState.session?.status;
-            if (status === SESSION_STATUS.QUESTION_LOCKED ||
-                status === SESSION_STATUS.QUESTION_RESULT) return;
-
+            if (status===SESSION_STATUS.QUESTION_LOCKED||status===SESSION_STATUS.QUESTION_RESULT) return;
             if (video.readyState < video.HAVE_ENOUGH_DATA) return;
-            if (!video.videoWidth || !video.videoHeight) return;
-
-            const frame = captureScanFrame(video, canvas, this._drawCtx);
-            if (!frame) return;
-
+            if (!video.videoWidth||!video.videoHeight) return;
+            canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+            ctx.drawImage(video, 0, 0);
+            const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
             this.frameCount++;
+            if (this.frameCount % 2 !== 0) return;
             this._scanFrame(frame);
         };
         tick();
     },
-
     _scanFrame(frame) {
         const students = appState.session?.students || [];
         if (!students.length) return;
-        if (this.frameCount % 2 !== 0) return;
-
         const hits = MarkerUtil.decodeAll(frame.data, frame.width, frame.height, students);
-        this._lastQuads = MarkerUtil.stats.quads;
-        this._lastDecoded = MarkerUtil.stats.decoded;
-
         const q = getCurrentQuestion(appState.session);
-        const seen = new Set();
-        for (const hit of hits) {
-            seen.add(hit.cardId);
-            this._trackHit(hit);
-        }
-
-        for (const [cardId, p] of this.pending) {
-            if (!seen.has(cardId)) {
-                p.missed = (p.missed || 0) + 1;
-                if (p.missed >= 4) this.pending.delete(cardId);
-            }
-        }
-
-        if (hits.length) {
-            const tip = $('#scan-frame-tip');
-            if (tip && isScanningAllowed()) {
-                tip.textContent = `Đang nhận ${hits.length} thẻ...`;
-            }
-        }
+        for (const hit of hits) this._trackHit(hit, q);
     },
-
-    _trackHit(hit) {
-        const q = getCurrentQuestion(appState.session);
+    _trackHit(hit, q) {
         if (!q) return;
-
         if (this.questionKey !== q.id) this.resetForQuestion(q.id);
-
         const locked = this.getConfirmedAnswer(hit.student.id, q.id);
         if (locked === hit.orientation) return;
-
         let p = this.pending.get(hit.cardId);
-        if (p && p.orientation === hit.orientation) {
-            p.frames++;
-            p.missed = 0;
-        } else {
-            p = { orientation: hit.orientation, frames: 1, missed: 0, student: hit.student };
-            this.pending.set(hit.cardId, p);
-        }
-
-        if (p.frames >= this.CONFIRM_FRAMES) {
-            this.pending.delete(hit.cardId);
-            this._fireScan(hit.cardId, hit.orientation, hit.student);
-        }
+        if (p && p.orientation === hit.orientation) { p.frames++; p.missed=0; }
+        else { p = { orientation: hit.orientation, frames:1, missed:0, student:hit.student }; this.pending.set(hit.cardId, p); }
+        if (p.frames >= this.CONFIRM_FRAMES) { this.pending.delete(hit.cardId); this._fireScan(hit.cardId, hit.orientation, hit.student); }
     },
-
-    _fireScan(cardId, orientation, knownStudent) {
-        onCardScanned(cardId, orientation, knownStudent);
-    }
+    _fireScan(cardId, orientation, student) { onCardScanned(cardId, orientation, student); }
 };
 
-function onCardScanned(cardId, orientation, knownStudent = null) {
+function onCardScanned(cardId, orientation, student) {
     const s = appState.session;
-    if (!s?.students?.length || !isScanningAllowed()) return;
+    if (!s?.students?.length) return;
+    if (s.status===SESSION_STATUS.QUESTION_LOCKED||s.status===SESSION_STATUS.QUESTION_RESULT) return;
+    const q = getCurrentQuestion(s); if (!q) return;
 
-    const student = knownStudent || s.students.find(st => st.cardId === cardId);
-    if (!student) {
-        showScanFlash('Không tìm thấy thẻ này', true);
-        return;
-    }
+    // Ghi nhận local
+    if (!s.answers) s.answers = [];
+    const existingIdx = s.answers.findIndex(a => a.sessionId===s.id && a.questionId===q.id && a.studentId===student.id);
+    const record = { id: uid('ans'), sessionId: s.id, questionId: q.id, studentId: student.id, cardId, answer: orientation, isCorrect: null, submittedAt: Date.now() };
+    if (existingIdx >= 0) s.answers[existingIdx] = { ...s.answers[existingIdx], answer: orientation, submittedAt: Date.now() };
+    else s.answers.push(record);
 
-    const q = getCurrentQuestion(s);
-    if (!q) return;
+    CardScanner.confirmed.set(CardScanner._lockKey(q.id, student.id), orientation);
 
-    const result = recordAnswer(s, student.id, cardId, orientation);
-    if (!result.ok) return;
-
-    CardScanner.confirmed.set(
-        CardScanner._lockKey(q.id, student.id),
-        orientation
-    );
-
-    if (!SyncEngine.conn?.open) {
-        showToast('⚠ Mất kết nối máy chiếu — thử đồng bộ lại', 3000);
-        return;
-    }
-
-    SyncEngine.send({
-        type: 'ANSWER_SCANNED',
-        studentId: student.id,
-        cardId,
-        answer: orientation,
-        questionId: q?.id,
-        session: getSessionSnapshot()
-    });
-
-    const tag = $('#scan-last-flash');
-    if (tag) {
-        tag.textContent = result.updated
-            ? `↻ ${student.name} · đổi → ${orientation}`
-            : `✓ ${student.name} · ${orientation}`;
-        tag.classList.toggle('update', !!result.updated);
-        tag.classList.remove('hidden');
-        appState.lastFlashStudentId = student.id;
-        clearTimeout(showScanFlash._t);
-        showScanFlash._t = setTimeout(() => tag.classList.add('hidden'), result.updated ? 1200 : 900);
-    }
-
-    playSound('scan');
-    renderScanner();
+    // Gửi về presenter
+    SyncEngine.send({ type: 'ANSWER_SCANNED', studentId: student.id, cardId, answer: orientation, questionId: q.id });
+    renderPaperScanner();
 }
 
-function showScanFlash(text, isUpdate = false) {
-    const el = $('#scan-last-flash');
-    if (!el) return;
-    el.textContent = text;
-    el.classList.remove('hidden');
-    el.classList.toggle('update', isUpdate);
-    clearTimeout(showScanFlash._t);
-    showScanFlash._t = setTimeout(() => el.classList.add('hidden'), 900);
-}
-
-function renderScanner() {
-    const s = appState.session;
-    if (!s?.questions?.length) return;
-
-    const q = getCurrentQuestion(s);
-    if (q && CardScanner.questionKey !== q.id) {
-        CardScanner.resetForQuestion(q.id);
-    }
-
-    const answeredList = getAnswersForQuestion(s, q?.id).filter(a => a.answer);
-    const answered = answeredList.length;
-    const total = s.students.length;
-    const pending = total - answered;
-    const pct = total ? Math.round((answered / total) * 100) : 0;
-    const isResult = s.status === SESSION_STATUS.QUESTION_RESULT;
-
-    $('#scan-q-pill').textContent = `Câu ${s.currentQuestionIndex + 1}/${s.questions.length}`;
-    $('#scan-count-pill').textContent = `${answered}/${total}`;
-    $('#scan-progress-fill').style.width = pct + '%';
-    $('#scan-pending-count').textContent = pending;
-    $('#tab-pending-n').textContent = pending;
-    $('#tab-done-n').textContent = answered;
-
-    const lockBtn = $('#btn-lock-question');
-    if (lockBtn) {
-        lockBtn.classList.toggle('ready', pending === 0 && !isResult);
-        lockBtn.textContent = pending === 0 && !isResult ? '🔒 CHỐT — ĐỦ RỒI!' : '🔒 CHỐT CÂU';
-    }
-
-    const activeDock = $('#scanner-active');
-    const resultDock = $('#scanner-result');
-    if (activeDock) activeDock.classList.toggle('hidden', isResult);
-    if (resultDock) resultDock.classList.toggle('hidden', !isResult);
-
-    renderStudentDrawer(s, q);
-
-    if (isResult && q) {
-        const stats = getQuestionStats(s, q.id);
-        $('#scan-result-summary').textContent = `✓ Đáp án: ${q.correctAnswer} · ${answered}/${total} HS`;
-        const max = Math.max(1, ...['A', 'B', 'C', 'D'].map(id => stats.counts[id] || 0));
-        $('#scan-result-bars').innerHTML = ['A', 'B', 'C', 'D'].map(id => {
-            const n = stats.counts[id] || 0;
-            return `<div class="result-bar-row"><span>${id}${id === q.correctAnswer ? '✓' : ''}</span>
-                <div class="result-bar-track"><div class="result-bar-fill" style="width:${Math.round(n / max * 100)}%"></div></div>
-                <span>${n}</span></div>`;
-        }).join('');
-    }
-
-    updateOrientationUI();
-}
-
-function renderStudentDrawer(s, q) {
-    const list = $('#scanner-student-list');
-    if (!list) return;
-
-    const tab = appState.drawerTab;
-    let rows = s.students.map(st => {
-        const a = s.answers.find(x => x.questionId === q?.id && x.studentId === st.id);
-        const done = !!a?.answer;
-        return { st, done, ans: a?.answer || '—' };
-    });
-
-    if (tab === 'pending') rows = rows.filter(r => !r.done);
-    else if (tab === 'done') rows = rows.filter(r => r.done);
-
-    rows.sort((a, b) => {
-        if (a.done !== b.done) return a.done ? 1 : -1;
-        return (a.st.cardNumber || 0) - (b.st.cardNumber || 0);
-    });
-
-    list.innerHTML = rows.length ? rows.map(({ st, done, ans }) => `
-        <div class="scan-student-row ${done ? 'done' : 'pending'}${st.id === appState.lastFlashStudentId ? ' just-scanned' : ''}" data-id="${st.id}">
-            <span>Thẻ ${st.cardNumber} · ${esc(st.name)}</span>
-            <span class="ans-badge">${esc(ans)}</span>
-        </div>
-    `).join('') : `<p style="text-align:center;opacity:0.5;padding:1rem;font-weight:700;">${tab === 'pending' ? '🎉 Tất cả đã quét!' : 'Chưa ai quét'}</p>`;
-}
-
-async function startCamera() {
-    if (appState.cameraReady || appState.cameraStarting) return appState.cameraReady;
-
-    appState.cameraStarting = true;
-
-    // Hiện màn quét TRƯỚC — iOS không cấp kích thước video khi thẻ bị display:none
-    showView('scanner');
-
-    const loading = $('#camera-loading');
-    loading?.classList.remove('hidden');
-
-    const video = $('#scanner-video');
-    const canvas = $('#scanner-canvas');
-    let ok = false;
-
-    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-
-    for (let attempt = 0; attempt < 2 && !ok; attempt++) {
-        ok = await CardScanner.start(video, canvas);
-        if (ok) {
-            await waitForVideoReady(video);
-            await video.play().catch(() => {});
-            if (!CardScanner.rafId) CardScanner._ensureLoop(video, canvas);
+/* ===== MARKER UTIL (Plickers — phải khớp hệt app.js presenter) ===== */
+const MarkerUtil = {
+    ORIENT: ['A','B','C','D'],
+    DATA_CELLS: (() => {
+        const cells = [];
+        for (let r=1;r<=5;r++) for (let c=1;c<=5;c++) {
+            if ((r===1||r===5)&&(c===1||c===5)) continue; cells.push([r,c]);
         }
-        if (!ok && attempt === 0) await new Promise(r => setTimeout(r, 600));
-    }
-
-    loading?.classList.add('hidden');
-    appState.cameraStarting = false;
-
-    if (ok) {
-        updateOrientationUI();
-        renderScanner();
-        if (!ScanOrientation.isLandscape()) {
-            showToast('📱 Cầm dọc máy để quét · Muốn xoay ngang: mở khóa xoay trước', 3200);
+        return cells;
+    })(),
+    MIN_CODE_DISTANCE: 7, _book: null, _bookSize: 0,
+    buildBook(count) {
+        const bits=this.DATA_CELLS.length; const book=[];
+        let seed=0x1f2e3d4c>>>0;
+        const next=()=>{seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed;};
+        let guard=0;
+        while(book.length<count&&guard<500000){
+            guard++;
+            const code=new Uint8Array(bits);let ones=0;
+            for(let i=0;i<bits;i++){const b=(next()>>>18)&1;code[i]=b;ones+=b;}
+            if(ones<6||ones>bits-6)continue;
+            let ok=true;
+            for(const prev of book){let d=0;for(let i=0;i<bits;i++)if(prev[i]!==code[i])d++;if(d<this.MIN_CODE_DISTANCE){ok=false;break;}}
+            if(ok)book.push(code);
         }
-    } else {
-        showToast('Không mở được camera — kiểm tra quyền truy cập');
-        showView('camera-prompt');
-    }
-    return ok;
-}
-
-function confirmLockQuestion() {
-    const s = appState.session;
-    const q = getCurrentQuestion(s);
-    if (!q) return;
-    const answered = getAnswersForQuestion(s, q.id).filter(a => a.answer).length;
-    const missing = s.students.length - answered;
-
-    if (missing > 0) {
-        showModal(`
-            <h3>⚠ Còn ${missing} học sinh chưa trả lời</h3>
-            <p>Bạn vẫn muốn chốt câu?</p>
-            <div class="modal-actions">
-                <button class="btn btn-secondary" id="mc-cancel">Quay lại</button>
-                <button class="btn btn-primary" id="mc-ok">Chốt câu</button>
-            </div>
-        `);
-        $('#mc-cancel').onclick = hideModal;
-        $('#mc-ok').onclick = () => { hideModal(); doLockQuestion(); };
-    } else {
-        doLockQuestion();
-    }
-}
-
-function doLockQuestion() {
-    SyncEngine.send({ type: 'LOCK_QUESTION' });
-    setTimeout(() => SyncEngine.send({ type: 'REQUEST_STATE' }), 400);
-    playSound('lock');
-}
-
-function showChoosersModal() {
-    const s = appState.session;
-    const q = getCurrentQuestion(s);
-    const stats = getQuestionStats(s, q.id);
-    const byAnswer = { A: [], B: [], C: [], D: [] };
-
-    stats.answers.forEach(a => {
-        if (a.answer && byAnswer[a.answer]) {
-            const st = s.students.find(x => x.id === a.studentId);
-            if (st) byAnswer[a.answer].push(st.name);
+        return book;
+    },
+    getCode(n){
+        const need=Math.max(60,n+10);
+        if(!this._book||this._bookSize<need){this._book=this.buildBook(need);this._bookSize=need;}
+        return this._book[(Math.max(1,n)-1)%this._book.length];
+    },
+    getGrid(n){
+        const grid=Array.from({length:7},()=>Array(7).fill(0));
+        for(let i=0;i<7;i++){grid[0][i]=grid[6][i]=grid[i][0]=grid[i][6]=1;}
+        grid[1][1]=1;grid[1][5]=0;grid[5][1]=0;grid[5][5]=0;
+        const code=this.getCode(n);
+        this.DATA_CELLS.forEach(([r,c],i)=>{grid[r][c]=code[i];});
+        return grid;
+    },
+    getLegacyGrid(n){
+        const grid=Array.from({length:7},()=>Array(7).fill(0));
+        for(let i=0;i<7;i++){grid[0][i]=grid[6][i]=grid[i][0]=grid[i][6]=1;}
+        let seed=n*7919+104729;
+        for(let r=1;r<6;r++)for(let c=1;c<6;c++){seed=(seed*1103515245+12345)&0x7fffffff;grid[r][c]=(seed%3)!==0?1:0;}
+        grid[1][1]=grid[1][5]=grid[5][1]=1;grid[5][5]=0;return grid;
+    },
+    _buildPatterns(students){
+        const patterns=[];
+        for(const st of students){
+            patterns.push({student:st,grid:this.getGrid(st.cardNumber),legacy:false});
+            patterns.push({student:st,grid:this.getLegacyGrid(st.cardNumber),legacy:true});
         }
-    });
-
-    showModal(`
-        <h3>👁 Người chọn — Câu ${s.currentQuestionIndex + 1}</h3>
-        <div class="choosers-list">
-            ${['A', 'B', 'C', 'D'].map(id => `
-                <div class="chooser-group ${id === q.correctAnswer ? 'correct' : ''}">
-                    <h4>${id}${id === q.correctAnswer ? ' ✓' : ''}</h4>
-                    <ul>${(byAnswer[id].length ? byAnswer[id] : ['—']).map(n => `<li>${esc(n)}</li>`).join('')}</ul>
-                </div>
-            `).join('')}
-        </div>
-        <div class="modal-actions"><button class="btn btn-primary" id="mc-close">Đóng</button></div>
-    `);
-    $('#mc-close').onclick = hideModal;
-}
-
-function confirmEndSession() {
-    const s = appState.session;
-    showModal(`
-        <h3>🛑 Kết thúc phiên?</h3>
-        <p>${s?.students?.length || 0} học sinh</p>
-        <div class="modal-actions">
-            <button class="btn btn-secondary" id="me-cancel">Hủy</button>
-            <button class="btn btn-primary" id="me-ok" style="background:#ef4444;">Kết thúc</button>
-        </div>
-    `);
-    $('#me-cancel').onclick = hideModal;
-    $('#me-ok').onclick = () => { hideModal(); SyncEngine.send({ type: 'END_SESSION' }); };
-}
-
-function startReconnectLoop(sessionId) {
-    SyncEngine.reconnectTimer = setInterval(async () => {
-        if (!SyncEngine.conn?.open) {
-            $('#scanner-reconnect')?.classList.remove('hidden');
-            const ok = await SyncEngine.connectScanner(sessionId);
-            if (ok) {
-                $('#scanner-reconnect')?.classList.add('hidden');
-                notifyHostConnected();
-                startStatePoll();
-                $('#wait-status').textContent = 'Đã kết nối lại';
+        return patterns;
+    },
+    rotateGrid(grid,times){
+        let g=grid.map(row=>[...row]);
+        for(let t=0;t<times;t++){
+            const n=g.length;const rotated=Array.from({length:n},()=>Array(n).fill(0));
+            for(let r=0;r<n;r++)for(let c=0;c<n;c++)rotated[c][n-1-r]=g[r][c];
+            g=rotated;
+        }
+        return g;
+    },
+    toGray(src,sw,sh,maxW){
+        const scale=Math.min(1,maxW/sw);const w=Math.max(1,Math.round(sw*scale));const h=Math.max(1,Math.round(sh*scale));
+        const gray=new Uint8Array(w*h);
+        for(let y=0;y<h;y++){const sy=Math.min(sh-1,Math.round(y/scale));for(let x=0;x<w;x++){const sx=Math.min(sw-1,Math.round(x/scale));const i=(sy*sw+sx)*4;gray[y*w+x]=(src[i]*77+src[i+1]*150+src[i+2]*29)>>8;}}
+        return{gray,w,h};
+    },
+    adaptiveThreshold(gray,w,h){
+        const iw=w+1;const integral=new Uint32Array(iw*(h+1));
+        for(let y=0;y<h;y++){let rs=0;for(let x=0;x<w;x++){rs+=gray[y*w+x];integral[(y+1)*iw+(x+1)]=integral[y*iw+(x+1)]+rs;}}
+        const bin=new Uint8Array(w*h);const half=Math.max(4,Math.round(Math.min(w,h)/14));
+        for(let y=0;y<h;y++){const y0=Math.max(0,y-half);const y1=Math.min(h-1,y+half);for(let x=0;x<w;x++){const x0=Math.max(0,x-half);const x1=Math.min(w-1,x+half);const area=(y1-y0+1)*(x1-x0+1);const sum=integral[(y1+1)*iw+(x1+1)]-integral[y0*iw+(x1+1)]-integral[(y1+1)*iw+x0]+integral[y0*iw+x0];bin[y*w+x]=gray[y*w+x]*area<sum*0.86?1:0;}}
+        return bin;
+    },
+    findQuads(bin,w,h){
+        const total=w*h;const seen=new Uint8Array(total);const stack=new Int32Array(total);const quads=[];
+        const minArea=Math.max(120,Math.round(total/6000));const maxArea=Math.round(total*0.5);
+        for(let start=0;start<total;start++){
+            if(!bin[start]||seen[start])continue;
+            let sp=0;stack[sp++]=start;seen[start]=1;
+            let area=0,minX=w,maxX=-1,minY=h,maxY=-1,minSum=Infinity,maxSum=-Infinity,minDiff=Infinity,maxDiff=-Infinity,pTL=0,pBR=0,pBL=0,pTR=0;
+            while(sp>0){
+                const p=stack[--sp];const x=p%w;const y=(p/w)|0;area++;
+                if(x<minX)minX=x;if(x>maxX)maxX=x;if(y<minY)minY=y;if(y>maxY)maxY=y;
+                const s=x+y;const d=x-y;
+                if(s<minSum){minSum=s;pTL=p;}if(s>maxSum){maxSum=s;pBR=p;}if(d<minDiff){minDiff=d;pBL=p;}if(d>maxDiff){maxDiff=d;pTR=p;}
+                for(let dy=-1;dy<=1;dy++){const ny=y+dy;if(ny<0||ny>=h)continue;for(let dx=-1;dx<=1;dx++){const nx=x+dx;if(nx<0||nx>=w)continue;const np=ny*w+nx;if(bin[np]&&!seen[np]){seen[np]=1;stack[sp++]=np;}}}
             }
+            if(area<minArea||area>maxArea)continue;
+            const bw=maxX-minX+1;const bh=maxY-minY+1;if(bw<16||bh<16)continue;
+            const br=bw/bh;if(br<0.5||br>2)continue;
+            const pt=p=>({x:p%w,y:(p/w)|0});const quad=[pt(pTL),pt(pTR),pt(pBR),pt(pBL)];
+            if(!this.isSquarish(quad,area))continue;
+            quads.push(quad);if(quads.length>=64)break;
         }
-    }, 5000);
-}
-
-function startStatePoll() {
-    clearInterval(SyncEngine.statePollTimer);
-    SyncEngine.statePollTimer = setInterval(() => {
-        if (appState.session?.questions?.length && appState.session?.students?.length) {
-            clearInterval(SyncEngine.statePollTimer);
-            onSessionUpdated();
-            return;
+        return quads;
+    },
+    isSquarish(quad,area){
+        const len=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+        const sides=[len(quad[0],quad[1]),len(quad[1],quad[2]),len(quad[2],quad[3]),len(quad[3],quad[0])];
+        const mn=Math.min(...sides);const mx=Math.max(...sides);
+        if(mn<14||mn/mx<0.55)return false;
+        const qa=0.5*Math.abs((quad[0].x*quad[1].y-quad[1].x*quad[0].y)+(quad[1].x*quad[2].y-quad[2].x*quad[1].y)+(quad[2].x*quad[3].y-quad[3].x*quad[2].y)+(quad[3].x*quad[0].y-quad[0].x*quad[3].y));
+        if(qa<=0)return false;const fill=area/qa;return fill>0.28&&fill<1.05;
+    },
+    samplePerspective(gray,w,h,quad){
+        const n=7;const at=(u,v)=>{
+            const x=(1-u)*(1-v)*quad[0].x+u*(1-v)*quad[1].x+u*v*quad[2].x+(1-u)*v*quad[3].x;
+            const y=(1-u)*(1-v)*quad[0].y+u*(1-v)*quad[1].y+u*v*quad[2].y+(1-u)*v*quad[3].y;
+            const xi=Math.round(x);const yi=Math.round(y);
+            if(xi<0||yi<0||xi>=w||yi>=h)return -1;return gray[yi*w+xi];
+        };
+        const offsets=[[0.5,0.5],[0.33,0.33],[0.67,0.33],[0.33,0.67],[0.67,0.67]];
+        const vals=Array.from({length:n},()=>Array(n).fill(255));
+        for(let r=0;r<n;r++)for(let c=0;c<n;c++){let sum=0,count=0;for(const[ou,ov]of offsets){const v=at((c+ou)/n,(r+ov)/n);if(v>=0){sum+=v;count++;}}vals[r][c]=count?sum/count:255;}
+        return vals;
+    },
+    binarizeCells(vals){
+        const flat=[];for(const row of vals)for(const v of row)flat.push(v);
+        const mn=Math.min(...flat);const mx=Math.max(...flat);if(mx-mn<35)return null;
+        let threshold=(mn+mx)/2,bestVar=-1;
+        for(let t=mn+2;t<mx;t+=3){let sL=0,nL=0,sH=0,nH=0;for(const v of flat){if(v<t){sL+=v;nL++;}else{sH+=v;nH++;}}if(!nL||!nH)continue;const diff=sL/nL-sH/nH;const vb=nL*nH*diff*diff;if(vb>bestVar){bestVar=vb;threshold=t;}}
+        return vals.map(row=>row.map(v=>(v<threshold?1:0)));
+    },
+    hasBorderRing(grid){let dark=0;for(let i=0;i<7;i++){dark+=grid[0][i]+grid[6][i];if(i>0&&i<6)dark+=grid[i][0]+grid[i][6];}return dark>=21;},
+    matchGrid(sampled,patterns){
+        for(let rot=0;rot<4;rot++){
+            const g=this.rotateGrid(sampled,rot);
+            const mA=g[1][1]===1&&g[1][5]===0&&g[5][1]===0&&g[5][5]===0;
+            const lA=g[1][1]===1&&g[1][5]===1&&g[5][1]===1&&g[5][5]===0;
+            if(!mA&&!lA)continue;
+            let best=null,secondDist=Infinity;
+            for(const p of patterns){
+                if(p.legacy&&!lA)continue;if(!p.legacy&&!mA)continue;
+                let d=0;for(const[r,c]of this.DATA_CELLS)if(g[r][c]!==p.grid[r][c])d++;
+                if(!best||d<best.d){secondDist=best?best.d:secondDist;best={d,student:p.student};}else if(d<secondDist)secondDist=d;
+            }
+            if(!best||best.d>4)continue;if(secondDist-best.d<1)continue;
+            return{student:best.student,cardId:best.student.cardId,cardNumber:best.student.cardNumber,orientation:this.ORIENT[rot],dist:best.d};
         }
-        if (SyncEngine.conn?.open) SyncEngine.requestState();
-    }, 2000);
-}
-
-function notifyHostConnected() {
-    SyncEngine.send({ type: 'SCANNER_CONNECTED', from: 'scanner' });
-    SyncEngine.requestState();
-}
-
-async function init(sessionId) {
-    appState.sessionId = sessionId;
-    appState.session = { id: sessionId, status: SESSION_STATUS.WAITING, students: [], questions: [], answers: [] };
-
-    $('#wait-session').textContent = getShortSessionCode(sessionId);
-    showView('waiting');
-
-    SyncEngine.onMessage = handleSyncMessage;
-
-    const connected = await SyncEngine.connectScanner(sessionId);
-    if (connected) {
-        notifyHostConnected();
-        $('#wait-status').textContent = 'Đã kết nối — đang lấy dữ liệu từ máy chiếu...';
-        startStatePoll();
-    } else {
-        $('#wait-status').textContent = 'Chưa kết nối — mở phiên trên máy tính trước, rồi quét lại QR';
-        showToast('Đang thử kết nối lại...');
+        return null;
+    },
+    decodeAll(imageData,width,height,students){
+        if(!students?.length)return[];
+        const{gray,w,h}=this.toGray(imageData,width,height,640);
+        const bin=this.adaptiveThreshold(gray,w,h);
+        const quads=this.findQuads(bin,w,h);
+        if(!quads.length)return[];
+        const patterns=this._buildPatterns(students);
+        const byCard=new Map();
+        for(const quad of quads){
+            const vals=this.samplePerspective(gray,w,h,quad);
+            const sampled=this.binarizeCells(vals);
+            if(!sampled||!this.hasBorderRing(sampled))continue;
+            const hit=this.matchGrid(sampled,patterns);if(!hit)continue;
+            const prev=byCard.get(hit.cardId);
+            if(!prev||hit.dist<prev.dist)byCard.set(hit.cardId,hit);
+        }
+        return Array.from(byCard.values());
+    },
+    rotateRgba90CW(data,w,h,times){
+        let src=data,cw=w,ch=h;
+        for(let t=0;t<times;t++){
+            const out=new Uint8ClampedArray(cw*ch*4);const nw=ch,nh=cw;
+            for(let y=0;y<ch;y++)for(let x=0;x<cw;x++){const si=(y*cw+x)*4;const nx=ch-1-y,ny=x;const di=(ny*nw+nx)*4;out[di]=src[si];out[di+1]=src[si+1];out[di+2]=src[si+2];out[di+3]=src[si+3];}
+            src=out;cw=nw;ch=nh;
+        }
+        return{data:src,width:cw,height:ch};
+    },
+    decodeWithRotations(imageData,width,height,students,rotations){
+        const perCard=new Map();
+        for(const times of rotations){
+            let data=imageData,w=width,h=height;
+            if(times>0){const r=this.rotateRgba90CW(imageData,width,height,times);data=r.data;w=r.width;h=r.height;}
+            const hits=this.decodeAll(data,w,h,students);
+            for(const hit of hits){const prev=perCard.get(hit.cardId);if(!prev||hit.dist<prev.dist)perCard.set(hit.cardId,hit);}
+        }
+        return Array.from(perCard.values());
     }
-
-    startReconnectLoop(sessionId);
-}
-
-function showScanMenu() {
-    const s = appState.session;
-    showModal(`
-        <h3>☰ Quản lý quét</h3>
-        <ul class="menu-list">
-            <li><button type="button" id="mm-drawer">👥 Danh sách học sinh</button></li>
-            <li><button type="button" id="mm-choosers">👁 Ai chọn đáp án gì</button></li>
-            <li><button type="button" id="mm-resync">🔄 Đồng bộ lại máy chiếu</button></li>
-            <li><button type="button" class="danger" id="mm-end">🛑 Kết thúc phiên</button></li>
-        </ul>
-        <div class="modal-actions"><button class="btn btn-secondary btn-sm" id="mm-close">Đóng</button></div>
-    `);
-    $('#mm-close').onclick = hideModal;
-    $('#mm-drawer').onclick = () => { hideModal(); $('#scanner-drawer')?.classList.remove('hidden'); };
-    $('#mm-choosers').onclick = () => { hideModal(); showChoosersModal(); };
-    $('#mm-resync').onclick = () => { hideModal(); SyncEngine.requestState(); showToast('Đang đồng bộ...'); };
-    $('#mm-end').onclick = () => { hideModal(); confirmEndSession(); };
-}
-
-function bindEvents() {
-    $('#btn-start-camera')?.addEventListener('click', () => startCamera());
-    $('#btn-lock-question')?.addEventListener('click', confirmLockQuestion);
-    $('#btn-scan-menu')?.addEventListener('click', showScanMenu);
-    $('#btn-toggle-drawer')?.addEventListener('click', () => {
-        const d = $('#scanner-drawer');
-        d?.classList.toggle('hidden');
-        if (!d?.classList.contains('hidden')) renderScanner();
-    });
-    $$('.drawer-tab').forEach(btn => {
-        btn.addEventListener('click', () => {
-            $$('.drawer-tab').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            appState.drawerTab = btn.dataset.tab;
-            renderScanner();
-        });
-    });
-    $('#btn-next-q-result')?.addEventListener('click', () => {
-        SyncEngine.send({ type: 'NEXT_QUESTION' });
-        SyncEngine.requestState();
-        setTimeout(() => SyncEngine.requestState(), 500);
-        playSound('next');
-    });
-    $('#btn-show-choosers')?.addEventListener('click', showChoosersModal);
-    $('#modal-overlay')?.addEventListener('click', e => {
-        if (e.target === $('#modal-overlay')) hideModal();
-    });
-    document.addEventListener('click', e => {
-        const drawer = $('#scanner-drawer');
-        if (drawer && !drawer.classList.contains('hidden') &&
-            !drawer.contains(e.target) && !e.target.closest('#btn-toggle-drawer')) {
-            drawer.classList.add('hidden');
-        }
-    });
-}
-
-document.addEventListener('DOMContentLoaded', () => {
-    bindEvents();
-    ScanOrientation.init(() => {
-        CardScanner.pending.clear();
-    });
-    updateOrientationUI();
-    const params = new URLSearchParams(location.search);
-    const sessionId = params.get('session');
-    if (!sessionId) {
-        showView('no-session');
-        return;
-    }
-    init(sessionId);
-});
+};
