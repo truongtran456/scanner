@@ -3,127 +3,141 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Rung Chuông Vàng — Học sinh</title>
+    <title>Rung Chuông Vàng — Scanner</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;600;700&family=Oswald:wght@600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css?v=3">
+    <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <div id="app">
 
-    <!-- ===== NHẬP MÃ PHÒNG ===== -->
-    <section id="view-enter-code" class="view active">
-        <div class="sv-logo">🔔</div>
-        <h1 class="sv-title">RUNG CHUÔNG VÀNG</h1>
-        <p class="sv-sub">Nhập mã phòng để vào thi</p>
-        <div class="sv-card">
-            <label class="sv-label">Mã phòng</label>
-            <input type="text" id="room-code-input" class="sv-input sv-input-big"
-                   placeholder="VD: AB123" autocomplete="off" autocapitalize="characters" spellcheck="false">
-            <button class="sv-btn sv-btn-gold" id="btn-join-room">Vào phòng →</button>
+    <!-- ĐANG KẾT NỐI -->
+    <section id="view-connecting" class="view active">
+        <div class="sc-center">
+            <div class="sc-bell">🔔</div>
+            <h1 class="sc-title">RUNG CHUÔNG VÀNG</h1>
+            <p class="sc-sub">Đang kết nối tới phòng...</p>
+            <div class="sc-spinner"></div>
+            <div id="connect-status" class="sc-status"></div>
+            <div id="session-code-badge" class="sc-code-badge"></div>
         </div>
-        <div id="enter-code-status" class="sv-status"></div>
     </section>
 
-    <!-- ===== CHỌN TÊN ===== -->
-    <section id="view-pick-name" class="view">
-        <div class="sv-logo">🔔</div>
-        <h1 class="sv-title">RUNG CHUÔNG VÀNG</h1>
-        <div class="sv-room-badge" id="pick-room-badge">Phòng: —</div>
-        <p class="sv-sub">Chọn tên của bạn</p>
-        <div id="student-name-list" class="sv-name-grid"></div>
-        <div id="pick-name-status" class="sv-status"></div>
-    </section>
-
-    <!-- ===== PHÒNG CHỜ ===== -->
+    <!-- CHỜ BẮT ĐẦU (đã kết nối, GV chưa bắt đầu) -->
     <section id="view-waiting" class="view">
-        <div class="sv-logo wait-logo">🔔</div>
-        <h1 class="sv-title">RUNG CHUÔNG VÀNG</h1>
-        <div class="sv-room-badge" id="wait-room-badge">Phòng: —</div>
-        <div class="sv-wait-card">
-            <div class="sv-wait-name" id="wait-student-name">—</div>
-            <div class="sv-wait-label">Đang chờ giáo viên bắt đầu...</div>
-            <div class="sv-wait-spinner"></div>
+        <div class="sc-center">
+            <div class="sc-bell">🔔</div>
+            <h1 class="sc-title">RUNG CHUÔNG VÀNG</h1>
+            <div class="sc-room-pill" id="wait-room-pill">Phòng: —</div>
+            <div class="sc-info-card">
+                <div class="sc-info-row">📋 <span id="wait-q-count">0 câu hỏi</span></div>
+                <div class="sc-info-row">👥 <span id="wait-st-count">0 học sinh</span></div>
+            </div>
+            <p class="sc-sub" id="wait-label">Đang chờ giáo viên bắt đầu...</p>
+            <div class="sc-spinner"></div>
         </div>
-        <div id="wait-status" class="sv-status"></div>
     </section>
 
-    <!-- ===== CÂU HỎI ===== -->
-    <section id="view-question" class="view">
+    <!-- MÀN HÌNH CAMERA QUÉT -->
+    <section id="view-scanner" class="view">
         <!-- Header nhỏ -->
-        <div class="sv-q-header">
-            <span class="sv-q-info" id="q-room-info">Phòng: —</span>
-            <span class="sv-q-num" id="q-num-label">Câu 1/1</span>
-            <div class="sv-countdown-wrap">
-                <svg class="sv-ring" viewBox="0 0 36 36">
-                    <circle cx="18" cy="18" r="14" class="sv-ring-bg"/>
-                    <circle cx="18" cy="18" r="14" class="sv-ring-fill" id="sv-ring-fill"/>
-                </svg>
-                <span id="sv-countdown" class="sv-countdown-num">15</span>
+        <div class="sc-header">
+            <div class="sc-header-left">
+                <span class="sc-room-pill-sm" id="scan-room-pill">—</span>
+                <span class="sc-q-pill" id="scan-q-pill">Câu 1/1</span>
+                <span class="sc-count-pill" id="scan-count-pill">0/0</span>
+            </div>
+            <div class="sc-header-right">
+                <button class="sc-icon-btn" id="btn-scan-menu" title="Menu">☰</button>
             </div>
         </div>
 
-        <!-- Câu hỏi -->
-        <div class="sv-question-card" id="sv-question-text">Đang tải câu hỏi...</div>
-        <div id="sv-question-image" class="sv-question-image"></div>
-
-        <!-- 4 đáp án -->
-        <div class="sv-answers-grid" id="sv-answers">
-            <button class="sv-ans-btn A" data-letter="A"><span class="sv-ans-badge">A</span><span class="sv-ans-text"></span></button>
-            <button class="sv-ans-btn B" data-letter="B"><span class="sv-ans-badge">B</span><span class="sv-ans-text"></span></button>
-            <button class="sv-ans-btn C" data-letter="C"><span class="sv-ans-badge">C</span><span class="sv-ans-text"></span></button>
-            <button class="sv-ans-btn D" data-letter="D"><span class="sv-ans-badge">D</span><span class="sv-ans-text"></span></button>
+        <!-- Camera + canvas ẩn -->
+        <div class="sc-camera-wrap">
+            <video id="scanner-video" class="sc-video" autoplay playsinline muted></video>
+            <canvas id="scanner-canvas" class="sc-canvas-hidden"></canvas>
+            <!-- Overlay khung quét -->
+            <div class="sc-viewfinder">
+                <div class="sc-vf-corner tl"></div>
+                <div class="sc-vf-corner tr"></div>
+                <div class="sc-vf-corner bl"></div>
+                <div class="sc-vf-corner br"></div>
+            </div>
+            <!-- Flash khi quét được -->
+            <div id="scan-flash" class="sc-flash hidden"></div>
+            <!-- Tên vừa quét -->
+            <div id="scan-last-flash" class="sc-last-flash hidden"></div>
         </div>
 
-        <!-- Trạng thái nộp -->
-        <div id="sv-submitted-banner" class="sv-submitted-banner hidden">
-            <span id="sv-submitted-text">✅ Đã nộp đáp án</span>
+        <!-- Thanh trạng thái dưới camera -->
+        <div class="sc-bottom-bar">
+            <div class="sc-progress-row">
+                <div class="sc-progress-track"><div id="sc-progress-fill" class="sc-progress-fill"></div></div>
+                <span id="sc-progress-label">0/0 đã quét</span>
+            </div>
+            <div class="sc-tip" id="sc-tip">Hướng camera vào thẻ học sinh</div>
         </div>
-        <div id="sv-status-bar" class="sv-status-bar"></div>
+
+        <!-- Nút chốt câu -->
+        <button class="sc-lock-btn" id="btn-lock-question">🔒 CHỐT CÂU</button>
     </section>
 
-    <!-- ===== KẾT QUẢ CÂU ===== -->
+    <!-- KẾT QUẢ CÂU -->
     <section id="view-result" class="view">
-        <div class="sv-q-header">
-            <span class="sv-q-info" id="res-room-info">Phòng: —</span>
-            <span class="sv-q-num" id="res-num-label">Câu 1/1</span>
+        <div class="sc-header">
+            <span class="sc-room-pill-sm" id="res-room-pill">—</span>
+            <span class="sc-q-pill" id="res-q-pill">Câu 1/1</span>
         </div>
-        <div class="sv-result-banner" id="sv-result-banner"></div>
-        <div class="sv-result-answers" id="sv-result-answers"></div>
-        <div class="sv-result-score-row">
-            <span class="sv-result-score-label">Điểm của bạn:</span>
-            <span class="sv-result-score-val" id="sv-score-val">0</span>
-        </div>
-        <div class="sv-wait-label">Chờ giáo viên sang câu tiếp...</div>
-    </section>
-
-    <!-- ===== KẾT THÚC ===== -->
-    <section id="view-ended" class="view">
-        <div class="sv-logo">🏆</div>
-        <h1 class="sv-title">KẾT THÚC</h1>
-        <div class="sv-wait-card">
-            <div class="sv-wait-name" id="end-student-name">—</div>
-            <div class="sv-end-score-row">
-                <span class="sv-end-score-label">Điểm tổng:</span>
-                <span class="sv-end-score-val" id="end-score-val">0</span>
+        <div class="sc-result-wrap">
+            <div class="sc-result-title">📊 KẾT QUẢ</div>
+            <div id="sc-result-bars" class="sc-result-bars"></div>
+            <div class="sc-result-detail">
+                <div class="sc-detail-col correct-col">
+                    <div class="sc-detail-title">✅ Đúng (<span id="sc-correct-count">0</span>)</div>
+                    <div id="sc-correct-list" class="sc-name-list"></div>
+                </div>
+                <div class="sc-detail-col wrong-col">
+                    <div class="sc-detail-title">❌ Sai (<span id="sc-wrong-count">0</span>)</div>
+                    <div id="sc-wrong-list" class="sc-name-list"></div>
+                </div>
+                <div class="sc-detail-col noans-col">
+                    <div class="sc-detail-title">⭕ Chưa quét (<span id="sc-noans-count">0</span>)</div>
+                    <div id="sc-noans-list" class="sc-name-list"></div>
+                </div>
             </div>
-            <div class="sv-end-correct" id="end-correct-info"></div>
         </div>
-        <p class="sv-sub">Cảm ơn bạn đã tham gia!</p>
+        <button class="sc-next-btn" id="btn-next-question">▶ Câu tiếp theo</button>
     </section>
 
-    <!-- ===== KHÔNG CÓ PHÒNG ===== -->
-    <section id="view-no-session" class="view">
-        <div class="sv-logo">😕</div>
-        <h1 class="sv-title">Không tìm thấy phòng</h1>
-        <p class="sv-sub">Hãy quét lại mã QR từ giáo viên hoặc nhập mã phòng.</p>
-        <button class="sv-btn sv-btn-gold" onclick="location.reload()">Thử lại</button>
+    <!-- KẾT THÚC -->
+    <section id="view-ended" class="view">
+        <div class="sc-center">
+            <div style="font-size:4rem">🏆</div>
+            <h1 class="sc-title">KẾT THÚC</h1>
+            <p class="sc-sub">Phiên thi đã hoàn thành!</p>
+        </div>
+    </section>
+
+    <!-- LỖI -->
+    <section id="view-error" class="view">
+        <div class="sc-center">
+            <div style="font-size:4rem">😕</div>
+            <h1 class="sc-title">Lỗi kết nối</h1>
+            <p class="sc-sub" id="error-msg">Không tìm thấy phòng. Quét lại QR.</p>
+            <button class="sc-lock-btn" onclick="location.reload()">Thử lại</button>
+        </div>
     </section>
 
 </div>
 
+<!-- Modal -->
+<div id="sc-modal" class="sc-modal hidden">
+    <div id="sc-modal-box" class="sc-modal-box"></div>
+</div>
+<div id="sc-toast" class="sc-toast hidden"></div>
+
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-<script src="app.js?v=3"></script>
+<script src="app.js"></script>
 </body>
 </html>
